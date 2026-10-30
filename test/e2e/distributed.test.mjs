@@ -217,6 +217,20 @@ try {
   }
   // Exercise the served frontend with reordered status replies and tab switches.
   const frontend = await (await a.request('/app.js')).text();
+  // Render the served reply formatter, including a table arriving in chunks.
+  const formattingUi = vm.createContext({ state: {session: {id:'formatting'}}, nodeApi: value => value });
+  vm.runInContext(frontend.slice(frontend.indexOf('const esc ='), frontend.indexOf('/** Local date')), formattingUi);
+  const tableReply = '**Replication**\n\n| Data | When it reconnects |\n|---|---|\n| Saved chats | Catch up through the log |\n| Files | Stay on their **owner** |\n\n- More work remains';
+  assert.doesNotMatch(formattingUi.render('| Data | When it reconnects |\n|--'), /<table>/);
+  const formatted = formattingUi.render(tableReply);
+  assert.match(formatted, /<thead><tr><th scope="col"/);
+  assert.match(formatted, /<td[^>]*>Stay on their <strong>owner<\/strong><\/td>/);
+  assert.match(formatted, /<\/table><\/div><br><ul><li>More work remains/);
+  assert.doesNotMatch(formatted, /\|---\|/);
+  assert.match(formattingUi.render('A | B\n:--- | ---:\n`a\\|b` | <script>bad</script>'), /<code>a\|b<\/code>/);
+  assert.doesNotMatch(formattingUi.render('A | B\n--- | ---\n<script>bad</script> | safe'), /<script>/);
+  assert.doesNotMatch(formattingUi.render('```\nA | B\n--- | ---\n```'), /<table>/);
+  assert.doesNotMatch(formattingUi.render('A | B\n---\nplain text'), /<table>/);
   // Stream into the saved progress slot, including collapsed progress and redraws.
   const streamTab = { session: { model: 'demo', events: [{ type: 'user', id: 'question' }] }, live: null };
   let progressChildren = [];

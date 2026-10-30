@@ -56,7 +56,7 @@ let pendingShots = [];
 const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 
 /**
- * Enough markdown to read like prose rather than source. Headings, bold, lists
+ * Enough markdown to read like prose rather than source. Headings, bold, lists, tables
  * and code - not a full parser, because anything it does not recognise should
  * survive as literal text rather than disappear.
  */
@@ -73,6 +73,14 @@ function render(text) {
     .join('');
 }
 
+// Split already-escaped table text without treating an escaped pipe as a column.
+function tableCells(line) {
+  const cells = line.trim().split(/(?<!\\)\|/);
+  if (!cells[0]?.trim()) cells.shift();
+  if (!cells.at(-1)?.trim()) cells.pop();
+  return cells.map(cell => cell.trim().replace(/\\\|/g, '|'));
+}
+
 function inline(chunk) {
   const lines = esc(chunk).split('\n');
   const out = [];
@@ -85,8 +93,25 @@ function inline(chunk) {
     if (list !== tag) { closeList(); out.push(`<${tag}>`); list = tag; }
   };
 
-  for (const raw of lines) {
+  for (let index = 0; index < lines.length; index++) {
+    const raw = lines[index];
     const line = raw.trimEnd();
+    const headers = tableCells(line);
+    const separators = tableCells(lines[index + 1] || '');
+    if (line.includes('|') && headers.length && headers.length === separators.length
+        && separators.every(cell => /^:?-{3,}:?$/.test(cell))) {
+      closeList();
+      const alignment = separators.map(cell => cell.endsWith(':') ? (cell.startsWith(':') ? 'center' : 'right') : 'left');
+      const row = (cells, tag) => `<tr>${headers.map((_, column) =>
+        `<${tag}${tag === 'th' ? ' scope="col"' : ''} style="text-align:${alignment[column]}">${emphasis(cells[column] || '')}</${tag}>`).join('')}</tr>`;
+      out.push(`<div class="message-table" role="region" aria-label="Message table" tabindex="0"><table><thead>${row(headers, 'th')}</thead><tbody>`);
+      index++;
+      while (index + 1 < lines.length && lines[index + 1].trim() && lines[index + 1].includes('|')) {
+        out.push(row(tableCells(lines[++index]), 'td'));
+      }
+      out.push('</tbody></table></div>');
+      continue;
+    }
     const heading = line.match(/^(#{1,4})\s+(.*)$/);
     const bullet = line.match(/^\s*[-*]\s+(.*)$/);
     const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
