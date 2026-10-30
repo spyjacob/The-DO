@@ -31,7 +31,7 @@ const api = async (url, opts = {}) => {
     headers: { 'Content-Type': 'application/json', ...(opts.headers ?? {}) },
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(body.error ?? `${res.status}`), {status:res.status, code:body.code});
   return body;
 };
 
@@ -618,7 +618,7 @@ function clearLive(tab = state.tab) {
 
 let openingSession = null;   // the tap we are still fetching for
 
-async function openSession(id) {
+async function openSession(id, { startup = false } = {}) {
   if (sessionOffline(state.sessions.find(s => s.id === id))) return showBanner('This tab’s computer is offline. Reconnect it to open the tab.');
   window.cancelDictation?.();
   openingSession = id;
@@ -644,6 +644,7 @@ async function openSession(id) {
     if (openingSession !== id) return;
     openingSession = null;
     window.harnessTrace?.('visible', { screen: 'transcript', outcome: 'open-failed' });
+    if (startup) throw e;
     showBanner(e.message);
     drawTranscript();     // back to whatever was open before
     return;
@@ -862,6 +863,7 @@ function paintHeader() {
 function showBanner(msg, warn = false) {
   window.harnessTrace?.('visible', { screen: 'banner', outcome: msg ? 'error' : 'cleared' });
   const b = $('banner');
+  delete b.dataset.startup;
   b.textContent = msg;
   b.hidden = !msg;
   b.classList.toggle('warn', warn);
@@ -3724,11 +3726,40 @@ document.addEventListener('visibilitychange', reconcile);
 window.addEventListener('online', reconcile);
 setInterval(reconcile, 20_000);
 
+let startupRunning = false;
+let startupRetry = null;
 async function initializeApp() {
-  try { await refreshState(); } catch (e) { showBanner(e.message); machinesSheet(); return; }
-  const last = new URLSearchParams(location.search).get('session') || sessionStorage.getItem(sessionStorageKey);
-  if (last && state.sessions.some((s) => s.id === last)) await openSession(last);
-  else paintHeader();
+  if (startupRunning) return;
+  clearTimeout(startupRetry);
+  startupRetry = null;
+  startupRunning = true;
+  try {
+    await refreshState();
+    // Reconnection must not replace a chat the user already opened or its draft.
+    if (!state.session && !openingSession) {
+      let last = new URLSearchParams(location.search).get('session');
+      try { last ||= sessionStorage.getItem(sessionStorageKey); } catch {}
+      if (last && state.sessions.some(s => s.id === last)) await openSession(last, {startup:true});
+      else paintHeader();
+    }
+    if ($('banner').dataset.startup === 'waiting') {
+      delete $('banner').dataset.startup;
+      showBanner('');
+    }
+    window.harnessTrace?.('visible', {screen:'startup', outcome:'ready'});
+  } catch (error) {
+    const retryable = !error.status || [502,503,504].includes(error.status);
+    if (retryable) {
+      showBanner('DO is reconnecting to your computers. Your chat will reopen automatically…');
+      $('banner').dataset.startup = 'waiting';
+      window.harnessTrace?.('visible', {screen:'startup', outcome:'waiting'});
+      // Only read state and reopen the conversation. Never replay a submission.
+      startupRetry = setTimeout(() => initializeApp(), 3000);
+    } else {
+      showBanner(error.message);
+      window.harnessTrace?.('visible', {screen:'startup', outcome:'error'});
+    }
+  } finally { startupRunning = false; }
 }
 
 let networkChecking = false;

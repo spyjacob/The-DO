@@ -272,12 +272,12 @@ try {
       history:{state:null, replaceState:(_state,_title,url)=>{location.href=new URL(url,location).href;}},
       window:{harnessTrace:(event,details)=>traces.push({event,...details})},
       state:{sessions:windowSessions, models:{}, session:null}, tabs:{chat:{}},
-      $:()=>({}), sessionOffline:()=>false, closeSheet(){}, clearLive(){}, showSession(){},
+      $:()=>({dataset:{}}), clearTimeout, setTimeout, sessionOffline:()=>false, closeSheet(){}, clearLive(){}, showSession(){},
       listen(){}, paintHeader(){}, showBanner(){}, drawTranscript(){}, machinesSheet(){},
       refreshState:async()=>{}, api:route=>a.call(route),
     });
     vm.runInContext(frontend.slice(frontend.indexOf('let openingSession ='), frontend.indexOf('async function editTranscript(')), context);
-    vm.runInContext(frontend.slice(frontend.indexOf('async function initializeApp()'), frontend.indexOf('let networkChecking =')), context);
+    vm.runInContext(frontend.slice(frontend.indexOf('let startupRunning ='), frontend.indexOf('let networkChecking =')), context);
     return {context, location, remembered, traces};
   }
   const firstWindow = selectionWindow('http://harness/?session=stale&node=test-node');
@@ -291,6 +291,39 @@ try {
     await refreshed.context.initializeApp();
     assert.equal(refreshed.context.state.session.id,windowSessions[index].id,'refresh restores this window');
   }
+  // A startup election can end without any network-disconnect event. Retry reads
+  // and restore this window's actual server conversation without replaying work.
+  const recovering = selectionWindow(firstWindow.location.href);
+  let retryStartup, startupReads = 0, startupBanner = '';
+  const startupElement = {dataset:{}};
+  recovering.context.$ = () => startupElement;
+  recovering.context.showBanner = text => { startupBanner = text; };
+  recovering.context.setTimeout = fn => { retryStartup = fn; return 1; };
+  recovering.context.clearTimeout = () => {};
+  recovering.context.machinesSheet = () => assert.fail('election must not force open settings');
+  recovering.context.refreshState = async () => {
+    startupReads++;
+    if (startupReads === 1) throw Object.assign(Error('Coordinator election in progress. No operation was replayed.'), {status:503});
+    await a.call('/api/state');
+  };
+  let failOpen = true;
+  recovering.context.api = async route => {
+    assert.ok(!route.endsWith('/send') && !route.endsWith('/queue'));
+    if (failOpen) { failOpen = false; throw Object.assign(Error('Coordinator unavailable'), {status:503}); }
+    return a.call(route);
+  };
+  await recovering.context.initializeApp();
+  assert.match(startupBanner, /automatically/);
+  assert.equal(recovering.context.state.session,null);
+  await retryStartup(); // election ended, but opening the transcript can still fail
+  assert.equal(recovering.context.state.session,null);
+  await retryStartup();
+  assert.equal(recovering.context.state.session.id,windowSessions[0].id);
+  assert.equal(startupBanner,'');
+  assert.deepEqual(recovering.traces.filter(e=>e.screen === 'startup').map(e=>e.outcome), ['waiting','waiting','ready']);
+  await recovering.context.openSession(windowSessions[1].id);
+  await recovering.context.initializeApp();
+  assert.equal(recovering.context.state.session.id,windowSessions[1].id,'reconnection preserves a newer selection');
   const beforeFailure = firstWindow.location.href;
   firstWindow.context.api = async()=>{throw Error('Host unavailable');};
   await firstWindow.context.openSession('missing-session');

@@ -222,3 +222,12 @@ exercise 41 tool steps and effort rejection. Browser checks use fictional data a
 not been performed. Codex app-server integration, durable queued messages, and
 conflict-safe partition reconciliation remain follow-up architectural work;
 unrelated used features were preserved rather than removed speculatively.
+
+
+Startup retries state loading and reopening the window's saved chat every three
+seconds after a temporary coordinator/network failure. It shows a reconnecting
+banner instead of opening Machines settings. These retries only read state; they
+never replay Send, Queue or other mutations, and preserve an already open chat.
+Diagnostics emit `startup` visible states `waiting`, `ready`, and `error` in the
+existing host-local history. Reproduce by opening DO during an election: the
+saved chat should reopen once the coordinator is available, without a reload.
