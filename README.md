@@ -91,6 +91,29 @@ Don't like the app, the layout, or how The DO works? Tell a session what to
 change. For changes to The DO itself, use its built-in project, review the result,
 then **Push** and **Restart**.
 
+## Choose how a session works
+
+In **Edit session**, choose the model and reasoning effort. The header shows the
+configured effort; “provider default” means DO has not overridden it. Unsupported
+levels report an error rather than silently reducing reasoning.
+
+Claude sessions use the Claude Code Agent SDK with native tools and local session
+resume. Questions and permission requests appear above the composer; answer,
+allow once, decline, or Stop. Claude permission modes are also available in Edit
+session, including plan-only and explicitly selected full host access. Native
+history stays on its execution computer; DO's portable transcript remains saved
+across the network.
+
+Codex currently uses `exec`, while API sources use DO's tools. Their capabilities
+are described in Edit session: the Codex adapter does **not yet** relay native
+interactive approvals or resume native threads. These are not interchangeable
+copies of the full terminal applications.
+
+Project records remain visible when their owner is offline. The list identifies
+where the files live; saved chats can still be opened, while execution requires
+the owning computer. Project metadata and transcripts are not a backup of
+uncommitted files on that computer.
+
 ## What you need
 
 On each computer:

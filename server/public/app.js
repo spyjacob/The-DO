@@ -691,7 +691,7 @@ function nextTabName(appId) {
 }
 
 function projectSession(app) {
-  const sessions = state.sessions.filter((s) => s.appId === app.id && !sessionOffline(s));
+  const sessions = state.sessions.filter((s) => s.appId === app.id).sort((a,b) => Number(sessionOffline(a)) - Number(sessionOffline(b)));
   const remembered = sessionStorage.getItem(`${sessionStorageKey}:app:${app.id}`);
   return sessions.find((s) => s.id === state.session?.id)
     || sessions.find((s) => s.id === remembered) || sessions[0];
@@ -815,12 +815,15 @@ function paintHeader() {
   const t = cur();
   $('title-name').textContent = state.apps?.find((a) => a.id === s?.appId)?.name || 'Distributed Orchestrator';
   $('title-sub').textContent = s
-    ? `Model: ${state.models[s.model]?.label || s.model}`
+    ? `Model: ${state.models[s.model]?.label || s.model} · effort: ${s.effort || state.models[s.model]?.effort || state.models[s.model]?.reasoningEffort || 'provider default'}`
     : 'pick a session';
-  $('send').disabled = !t.session;
+  $('send').disabled = !t.session || sessionOffline(t.session);
   $('input').placeholder = idlePlaceholder();
   const model = s && state.models[s.model];
-  if (s && s.projectDir === state.home) {
+  if (sessionOffline(s)) {
+    const owner = state.machines?.hosts?.find(h => h.id === s.ownerNode);
+    showBanner(`${owner?.name || 'This session’s computer'} is offline. You can read the saved conversation; reconnect that computer to continue.`, true);
+  } else if (s && s.projectDir === state.home) {
     showBanner('this session is rooted at your home folder — every project is in its scope. Use Edit session to give it its own directory.', true);
   } else if (s?.projectDirMissing) {
     showBanner(`${shortDir(s.projectDir)} no longer exists — use Edit session to choose another folder`, true);
@@ -842,6 +845,8 @@ function showBanner(msg, warn = false) {
 function paintComposerAction() {
   paintMessagePending();
   const busy = cur().running;
+  $('send').disabled = !cur().session || sessionOffline(cur().session);
+  $('queue').disabled = sessionOffline(cur().session);
   const hasDraft = Boolean($('input').value.trim()) || pendingShots.length > 0;
   $('send').hidden = busy;
   $('stop').hidden = !busy || hasDraft;
@@ -896,6 +901,9 @@ async function recoverTranscript(tab) {
   try {
     const fresh = await api(`/api/sessions/${session.id}`);
     if (t.session !== session || session.events.length !== count) return;
+    // A snapshot can arrive before the server has accepted this browser's send.
+    // Keep provisional messages until their authoritative event arrives.
+    fresh.events.push(...session.events.filter(e => e.optimistic && !fresh.events.some(saved => saved.clientMessageId && saved.clientMessageId === e.clientMessageId)));
     t.session = fresh;
     t.needsTranscript = false;
     if (tab === 'chat') state.session = fresh;
@@ -911,6 +919,7 @@ async function recoverTranscript(tab) {
 function listen(tab, id) {
   const t = tabs[tab];
   t.stream?.close();
+  showInteraction(null, id);
   const es = new EventSource(nodeApi(`/api/sessions/${id}/events`));
   t.stream = es;
 
@@ -918,12 +927,15 @@ function listen(tab, id) {
     if (t.stream !== es) return;
     const p = JSON.parse(msg.data);
     const active = tab === state.tab;
+    if (p.kind === 'interaction') { if (active) showInteraction(p.request, id); return; }
+    if (p.kind === 'hello' && active) showInteraction(p.interaction, id);
 
     if (p.kind === 'pending' && p.starting && t.session) {
-      t.session.events.push({id:'pending-' + p.starting.pendingId, ts:Date.now(), type:'user', text:p.starting.text, attachments:p.starting.attachments, optimistic:true});
+      t.session.events.push({id:'pending-' + p.starting.pendingId, ts:Date.now(), type:'user', text:p.starting.text, attachments:p.starting.attachments, clientMessageId:p.starting.clientMessageId, optimistic:true});
       if (active) drawTranscript();
     }
     if (p.kind === 'pending' || p.kind === 'hello') {
+      pendingVersions.set(id, (pendingVersions.get(id) || 0) + 1);
       pendingMessages.set(id, p.pending || []);
       if (active) paintMessagePending();
       if (p.kind === 'pending') return;
@@ -960,9 +972,9 @@ function listen(tab, id) {
 
     if (p.kind === 'started') setRunning(true, p.startedAt, null, tab);
     if (p.kind === 'event') {
-      clearLive(tab);
-      if (p.event.type === 'user' && t.session) t.session.events = t.session.events.filter(e => !e.optimistic);
-      t.session?.events.push(p.event);
+      if (p.event.type === 'assistant') clearLive(tab);
+      if (p.event.type === 'user' && t.session) t.session.events = t.session.events.filter(e => !e.optimistic || (p.event.clientMessageId ? e.clientMessageId !== p.event.clientMessageId : e.text !== p.event.text));
+      if (t.session && !t.session.events.some(e => e.id === p.event.id)) t.session.events.push(p.event);
 
       if (active) drawTranscript();
       if (p.event.type === 'assistant') setRunning(true, t.startedAt || null, null, tab);
@@ -987,6 +999,42 @@ function listen(tab, id) {
   es.onerror = () => {}; // EventSource reconnects on its own
 }
 
+function showInteraction(request, sessionId) {
+  const box = $('provider-interaction');
+  if (!box) return;
+  if (box.dataset.request === request?.id) return;
+  box.dataset.request = request?.id || '';
+  box.hidden = !request;
+  if ($('working-label')) $('working-label').textContent = request ? 'waiting for your response' : 'working';
+  if (!request) { box.replaceChildren(); return; }
+  const questions = request.kind === 'question' ? request.input.questions || [] : [];
+  box.innerHTML = `<details open><summary>${request.kind === 'question' ? 'Claude needs your answer' : 'Claude requests permission'}</summary>
+    ${questions.length ? questions.map((q,i) => `<label>${esc(q.question)}</label>
+      <p class="dim">${(q.options || []).map(o => esc(o.label) + ': ' + esc(o.description || '')).join('<br>')}</p>
+      <textarea data-answer="${i}" placeholder="Type your answer or option names"></textarea>`).join('')
+      : `<p>${esc(request.tool)}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto"></pre>`}
+    <div class="actions"><button class="primary" data-approve>${questions.length ? 'answer' : 'allow once'}</button><button class="ghost" data-decline>decline</button></div>
+    <p class="dim" data-error></p></details>`;
+  if (!questions.length) box.querySelector('pre').textContent = JSON.stringify(request.input, null, 2);
+  const respond = async allow => {
+    box.querySelectorAll('button').forEach(b => b.disabled = true);
+    try {
+      const answers = Object.fromEntries(questions.map((q,i) => [q.question, box.querySelector(`[data-answer="${i}"]`).value]));
+      await api(`/api/sessions/${sessionId}/interaction`, {method:'POST', body:JSON.stringify({id:request.id,allow,answers})});
+      window.harnessTrace?.('visible', {screen:'provider-request',outcome:allow ? 'answered' : 'declined',correlationId:request.id});
+      if (box.dataset.request === request.id) showInteraction(null, sessionId);
+    } catch(e) {
+      if (box.dataset.request !== request.id) return;
+      box.querySelector('[data-error]').textContent = e.message;
+      box.querySelectorAll('button').forEach(b => b.disabled = false);
+    }
+  };
+  box.querySelector('[data-approve]').onclick = () => respond(true);
+  box.querySelector('[data-decline]').onclick = () => respond(false);
+  window.harnessTrace?.('visible', {screen:'provider-request',outcome:request.kind,correlationId:request.id});
+}
+
+const pendingVersions = new Map();
 const pendingMessages = new Map();
 function paintMessagePending() {
   const box = $('message-pending');
@@ -1042,6 +1090,7 @@ async function send(queue = false) {
   if (pendingShots.some((a) => a.uploading)) return showBanner('still uploading — one moment');
   const t = cur();
   if (!t.session) return showBanner('open a session first — tap ☰');
+  if (sessionOffline(t.session)) return showBanner('This session’s computer is offline. Reconnect it to send; your draft is still here.');
   if (t.running && !queue) return showBanner('Tap Queue next to send after this turn, or Stop to interrupt.');
   const sessionId = t.session.id;
 
@@ -1049,8 +1098,10 @@ async function send(queue = false) {
   const button = $(queue ? 'queue' : 'send');
   if (button.disabled) return;
   button.disabled = true;
-  const optimistic = { id: 'pending-' + Date.now(), ts: Date.now(), type: 'user', text, attachments: shots, optimistic: true };
+  const clientMessageId = crypto.randomUUID();
+  const optimistic = { clientMessageId, id: 'pending-' + clientMessageId, ts: Date.now(), type: 'user', text, attachments: shots, optimistic: true };
   const previousQueue = pendingMessages.get(sessionId) || [];
+  const pendingVersion = pendingVersions.get(sessionId) || 0;
   if (queue) pendingMessages.set(sessionId, [...previousQueue, {text}]);
   else { t.session.events.push(optimistic); drawTranscript(); }
   $('input').value = '';
@@ -1065,26 +1116,33 @@ async function send(queue = false) {
     const result = await api(`/api/sessions/${sessionId}/${queue ? 'queue' : 'send'}`, {
       method: 'POST',
       body: JSON.stringify({
-        text,
+        text, clientMessageId,
         attachments: shots.map(({ name, path, mime, bytes }) => ({ name, path, mime, bytes })),
       }),
     });
     if (cur().session?.id === sessionId) {
       pendingShots = pendingShots.filter(a => !shots.includes(a));
       paintPending();
-      if (result.queued) {
-        pendingMessages.set(sessionId, result.pending);
-      } else pendingMessages.delete(sessionId);
+      if ((pendingVersions.get(sessionId) || 0) === pendingVersion) {
+        if (result.pending?.length) pendingMessages.set(sessionId, result.pending);
+        else pendingMessages.delete(sessionId);
+      }
       paintMessagePending();
     }
   } catch (e) {
+    // An SSE acknowledgement can arrive even if the HTTP response was lost.
+    if (t.session?.id === sessionId && t.session.events.some(event => !event.optimistic && event.clientMessageId === clientMessageId)) {
+      showBanner('Message saved; reconnecting to its progress.');
+      return;
+    }
     if (t.session?.id === sessionId) t.session.events = t.session.events.filter(e => e.id !== optimistic.id);
     if (cur().session?.id === sessionId) {
       if (!$('input').value) $('input').value = draft;
       pendingShots.push(...shots.filter(a => !pendingShots.includes(a)));
       paintPending(); drawTranscript();
     }
-    pendingMessages.set(sessionId, previousQueue); paintMessagePending();
+    if ((pendingVersions.get(sessionId) || 0) === pendingVersion) pendingMessages.set(sessionId, previousQueue);
+    paintMessagePending();
     if (!queue && cur().session?.id === sessionId) setRunning(false);
     showBanner(e.message);
   } finally { button.disabled = false; }
@@ -1647,6 +1705,7 @@ async function sessionSettingsSheet() {
         <div id="s-computers">${state.machines.hosts.filter(h => state.apps.find(a => a.id === session.appId).executionHosts.includes(h.id)).map(h => `
           <button class="rowlink" data-tab-computer="${esc(h.id)}" ${session.tabWorkspace || session.turnHost ? 'disabled' : ''}><span>${h.number} · ${esc(h.name)}</span><span class="dim">${h.id === session.ownerNode ? 'owns this tab' : h.active ? 'use computer' : 'offline'}</span></button>`).join('')}</div>
         <p class="dim">Each tab uses its computer’s models and files. To work on another computer after this tab has started, create a new tab there.</p>` : ''}
+      <p class="dim">${state.models[session.model]?.provider === 'claude-cli' ? 'Claude Code SDK: native tools, interactive questions and permissions, and native history on this host.' : state.models[session.model]?.provider === 'codex-cli' ? 'Codex exec: native tools, transcript replay each turn. Native interactive approvals are not yet supported by this adapter; check its sandbox configuration before running host actions.' : 'API model: DO tools and transcript. Native Claude Code / Codex extensions are not available through this API adapter.'}</p>
       <label>Model — tap to switch, history carries over</label>
       <div id="s-models">${Object.values(state.models).map((m) => `
         <div class="item${m.alias === session.model ? ' on' : ''}" data-switch="${esc(m.alias)}">
@@ -1657,6 +1716,12 @@ async function sessionSettingsSheet() {
             ? '<span class="pill ready">in use</span>'
             : `<span class="pill ${m.hasKey ? '' : 'missing'}">${m.hasKey ? 'switch' : 'no key'}</span>`}
         </div>`).join('')}</div>
+      ${state.models[session.model]?.provider === 'claude-cli' ? `<label>Claude permissions</label><select id="s-permission">${['default','acceptEdits','plan','bypassPermissions'].map(mode => `<option value="${mode}"${(session.claudePermission || state.models[session.model]?.permissionMode || 'default') === mode ? ' selected' : ''}>${{default:'Ask when needed',acceptEdits:'Accept edits; ask for other permissions',plan:'Plan only',bypassPermissions:'Full host access — no permission prompts'}[mode]}</option>`).join('')}</select><p class="dim">Claude asks through this chat. Full host access allows actions outside the project on the session’s computer.</p>` : ''}
+      <p class="dim">${(() => { const model = state.models[session.model] || {}; return `Turn steps: no DO cutoff. Output limit: ${model.maxTokens || (model.provider === 'anthropic' ? '32,000 tokens per response' : 'provider default')}.${model.maxTurns ? ` Native turn limit configured: ${model.maxTurns}.` : ''}`; })()}</p>
+      <label>Reasoning effort</label>
+      <select id="s-effort">${['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(level => `<option value="${level}"${(session.effort || '') === level ? ' selected' : ''}>${level || 'Model default'}</option>`).join('')}</select>
+      <p class="dim">Sent directly to the provider. Supported levels depend on the model; unsupported choices report an error instead of silently reducing effort. Default uses the model configuration.</p>
+      <div class="actions"><button class="ghost" id="s-effort-save">save effort</button></div>
       <label>Mode</label>
       <div class="row">
         <button class="ghost${session.mode !== 'chat' ? ' on' : ''}" data-mode="agent">agent</button>
@@ -1702,6 +1767,14 @@ async function sessionSettingsSheet() {
   });
   $('session-git').onclick = gitSheet;
   $('s-close').onclick = closeSheet;
+  if ($('s-effort-save')) $('s-effort-save').onclick = async () => {
+    try {
+      const updated = await api(`/api/sessions/${session.id}`, {method:'PATCH', body:JSON.stringify({effort:$('s-effort').value, ...($('s-permission') ? {claudePermission:$('s-permission').value} : {})})});
+      if (cur().session?.id === session.id) { cur().session = updated; state.session = updated; }
+      window.harnessTrace?.('visible', {screen:'session-settings', outcome:'effort-saved'});
+      showBanner('Effort saved for subsequent turns.');
+    } catch (e) { showBanner(e.message); }
+  };
   if ($('s-rename')) {
     const rename = async () => {
       const name = $('s-name').value.trim();
@@ -2684,6 +2757,7 @@ async function appsSheet() {
   // a second. The last known list goes up immediately and the fresh one folds
   // in when it lands; only the very first open of the session has nothing to
   // show. The two requests now go out together rather than one after the other.
+  if (!lastAppsData && state.apps?.length) lastAppsData = {apps:state.apps};
   if (lastAppsData) renderAppsSheet(lastAppsData);
   else openSheet('<h2>Apps &amp; Chats</h2><p class="dim">loading…</p>', 'apps');
 
@@ -2796,7 +2870,9 @@ function renderAppsSheet(d) {
   const appCard = (a) => {
     const launchable = Boolean(a.start?.trim());
     const mine = sessionsFor(a.id);
-    const label = !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
+    const owner = state.machines?.hosts?.find(h => h.id === a.ownerNode);
+    const offline = owner?.active === false;
+    const label = offline ? 'owner offline' : a.runtimeKnown === false ? 'remote · status unknown' : !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
     const links = [];
     if (a.urls?.phone) links.push(`<a href="${esc(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
     if (a.urls?.desktop) links.push(`<a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
@@ -2815,6 +2891,7 @@ function renderAppsSheet(d) {
          ${a.running && a.reachable && links.length ? `<div class="s app-links">${links.join('<br>')}</div>` : ''}`;
     const pill = a.builtin
       ? '<span class="pill self">self</span>'
+      : offline ? '<span class="pill">owner offline</span>'
       : !launchable && !a.running && !a.lastStartedAt && !a.hasBeenApp ? '<span class="pill">chat</span>'
       : `<span class="pill ${a.reachable ? 'ready' : a.running ? 'warm' : ''}">${label}</span>`;
     const actions = a.builtin
@@ -2822,7 +2899,7 @@ function renderAppsSheet(d) {
           <button class="x" data-harness-restart="1" title="Restart Harness: choose a machine">⟳</button>
         </div>`
       : `<div class="app-actions">
-          ${launchable || a.running ? `<button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : 'Start'}">${a.running ? '■' : '▶'}</button>` : ''}
+          ${launchable || a.running ? `<button class="x" data-app-run="${esc(a.id)}" title="${a.running ? 'Stop' : 'Start'}" ${offline || a.runtimeKnown === false ? 'disabled' : ''}>${a.running ? '■' : '▶'}</button>` : ''}
           <button class="x" data-app-edit="${esc(a.id)}" title="Edit project">✎</button>
         </div>`;
 
@@ -2832,6 +2909,7 @@ function renderAppsSheet(d) {
         <div class="grow">
           <div class="t">${esc(a.name)} ${pill}</div>
           ${meta}
+          ${owner && !a.builtin ? `<div class="s">Files on ${esc(owner.name)} · ${offline ? 'offline — saved chats remain readable; reconnect to run tools' : 'online'}</div>` : ''}
           ${(a.aiDependencies || []).map(dep => `<div class="s">AI: ${esc(dep.label || dep.alias)} · ${esc(state.machines?.hosts?.find(h => h.id === dep.host)?.name || dep.host)} · ${esc(dep.purpose)}</div>`).join('')}
           <div class="s dim">${mine.length} session${mine.length === 1 ? '' : 's'}</div>
         </div>
@@ -3639,7 +3717,17 @@ async function checkNetworkConnection() {
     }
   }
   try {
-    const status = await api('/api/network');
+    // Probe the page's serving host, even when a selected execution node is offline.
+    // Bound both headers and body so a suspended phone connection cannot lock retries.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    let status;
+    try {
+      const response = await nativeFetch('/api/network', { signal: controller.signal, cache: 'no-store' });
+      if (!response.ok) throw new Error(`Connection check returned ${response.status}`);
+      status = await response.json();
+      if (typeof status.connected !== 'boolean') throw new Error('Invalid connection response');
+    } finally { clearTimeout(timeout); }
     const connected = Boolean(status.connected);
     $('network-gate').hidden = connected;
     for (const element of document.body.children) {
@@ -3649,11 +3737,17 @@ async function checkNetworkConnection() {
     $('network-gate-message').textContent = status.error || status.message || 'Connect Tailscale on this computer. This screen refreshes automatically.';
     const restored = connected && !networkConnected;
     networkConnected = connected;
-    if (restored) await initializeApp();
+    window.harnessTrace?.('visible', { screen: 'connection', outcome: connected ? 'connected' : 'host-offline' });
+    // Opening a chat is separate from transport health; it must not hold this lock.
+    if (restored) initializeApp().catch(error => {
+      showBanner(error.message);
+      window.harnessTrace?.('visible', { screen: 'transcript', outcome: 'initialization-error' });
+    });
   } catch {
     $('network-gate').hidden = false;
     $('network-gate-title').textContent = 'Waiting for Harness';
-    $('network-gate-message').textContent = 'Could not check the connection. Retrying automatically…';
+    $('network-gate-message').textContent = 'This browser could not reach Harness on the serving computer. Check that computer is awake and Tailscale is connected on your phone. Retrying automatically…';
+    window.harnessTrace?.('visible', { screen: 'connection', outcome: 'unreachable' });
     networkConnected = false;
     for (const element of document.body.children) {
       if (element.id !== 'network-gate' && element.tagName !== 'SCRIPT') element.inert = true;

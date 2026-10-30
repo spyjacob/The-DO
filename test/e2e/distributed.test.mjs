@@ -18,6 +18,15 @@ const mock = http.createServer(async (req, res) => {
   const chunks = []; for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks));
   modelRequests.push(body);
+  if (body.messages.some(m=>m.content === 'unsupported-effort')) {
+    res.writeHead(400, {'Content-Type':'application/json'});
+    return res.end(JSON.stringify({error:{message:'reasoning_effort is unsupported'}}));
+  }
+  if (body.messages.some(m=>m.content === 'continue-past-forty') && body.messages.filter(m=>m.role === 'tool').length < 41) {
+    const n = body.messages.filter(m=>m.role === 'tool').length;
+    res.writeHead(200, {'Content-Type':'text/event-stream'});
+    return res.end(`data: ${JSON.stringify({choices:[{index:0,delta:{tool_calls:[{index:0,id:'step-'+n,type:'function',function:{name:'list_dir',arguments:'{"path":"."}'}}]},finish_reason:'tool_calls'}]})}\n\ndata: [DONE]\n\n`);
+  }
   res.writeHead(200, { 'Content-Type': 'text/event-stream' });
   res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: body.model }, finish_reason: null }] })}\n\n`);
   if (body.messages.at(-1)?.content === 'wait') await new Promise(r => { release = r; });
@@ -537,7 +546,7 @@ try {
   let parallelResult;
   for (let i = 0; i < 80; i++) {
     parallelResult = await a.call(`/api/sessions/${parallel.id}`);
-    if (!parallelResult.turnHost && parallelResult.events.some(e => e.type === 'assistant')) break;
+    if (!parallelResult.busy && !parallelResult.turnHost && parallelResult.events.some(e => e.type === 'assistant')) break;
     await pause();
   }
   assert.ok(parallelResult.events.some(e => e.type === 'assistant'));
@@ -554,7 +563,7 @@ try {
   let finished;
   for (let i = 0; i < 80; i++) {
     finished = await a.call(`/api/sessions/${s.id}`);
-    if (!finished.turnHost && finished.events.filter(e=>e.type === 'assistant').length >= 3) break;
+    if (!finished.busy && !finished.turnHost && finished.events.filter(e=>e.type === 'assistant').length >= 3) break;
     await pause();
   }
   assert.ok(!finished.turnHost);
@@ -741,7 +750,7 @@ try {
   let traceResult;
   for (let i = 0; i < 80; i++) {
     traceResult = await a.call(`/api/sessions/${traceSession.id}`);
-    if (!traceResult.turnHost && traceResult.events.some(e => e.type === 'assistant')) break;
+    if (!traceResult.busy && !traceResult.turnHost && traceResult.events.some(e => e.type === 'assistant')) break;
     await pause();
   }
   assert.ok(traceResult.events.some(e => e.type === 'assistant'));
@@ -758,11 +767,112 @@ try {
   assert.ok(chatRequest);
   assert.doesNotMatch(JSON.stringify(chatRequest.messages), /Tracing for future AI work/);
 
+  // Session effort is passed through unchanged; message retries do not run twice.
+  await a.call(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'max'});
+  const message = {text:'effort-and-idempotency',clientMessageId:'stable-message-1'};
+  await Promise.all([a.call(`/api/sessions/${traceSession.id}/send`, 'POST', message),
+    b.call(`/api/sessions/${traceSession.id}/send`, 'POST', message)]);
+  for (let i=0;i<100;i++) {
+    const current = await a.call(`/api/sessions/${traceSession.id}`);
+    if (!current.busy && !current.turnHost && current.events.some(e=>e.clientMessageId === message.clientMessageId)) break;
+    await pause();
+  }
+  await a.call(`/api/sessions/${traceSession.id}/send`, 'POST', message);
+  assert.equal(modelRequests.filter(r=>r.messages.at(-1)?.content === message.text).length,1);
+  assert.equal(modelRequests.find(r=>r.messages.at(-1)?.content === message.text).reasoning_effort,'max');
+  assert.equal((await a.request(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'invented'})).status,400);
+
+  const longTurn = await a.call('/api/sessions','POST',{name:'long turn',projectDir:path.join(root,'long-project'),model:'model-a',mode:'agent'});
+  await a.call(`/api/sessions/${longTurn.id}/send`,'POST',{text:'continue-past-forty'});
+  let longResult;
+  for(let i=0;i<200;i++) {
+    longResult = await a.call(`/api/sessions/${longTurn.id}`);
+    if(!longResult.busy && longResult.events.some(e=>e.type === 'assistant')) break;
+    await pause();
+  }
+  assert.equal(longResult.events.filter(e=>e.type === 'tool_result').length,41,'no hidden 40-step cutoff');
+  assert.ok(longResult.events.some(e=>e.type === 'assistant' && e.text === 'model-a'));
+  const rejected = await a.call('/api/sessions','POST',{name:'unsupported effort',model:'model-a',mode:'chat',projectDir:path.join(root,'unsupported-project')});
+  await a.call(`/api/sessions/${rejected.id}`,'PATCH',{effort:'max'});
+  await a.call(`/api/sessions/${rejected.id}/send`,'POST',{text:'unsupported-effort'});
+  for(let i=0;i<100 && (await a.call(`/api/sessions/${rejected.id}`)).busy;i++) await pause();
+  const rejectedRequests = modelRequests.filter(r=>r.messages.some(m=>m.content === 'unsupported-effort'));
+  assert.ok(rejectedRequests.length);
+  assert.ok(rejectedRequests.every(r=>r.reasoning_effort === 'max'),'never silently retry with reasoning disabled');
+
+  // Exercise the installed Agent SDK against a deterministic CLI protocol peer.
+  const configFile = path.join(a.dir,'models.json');
+  const config = JSON.parse(await fs.readFile(configFile,'utf8'));
+  config.models['native-test'] = {provider:'claude-cli',model:'fixture',bin:path.resolve('test/fixtures/claude-control.mjs')};
+  await fs.writeFile(configFile,JSON.stringify(config));
+  const native = await a.call('/api/sessions','POST',{name:'native',model:'native-test',mode:'agent',projectDir:path.join(root,'native-project')});
+  await a.call(`/api/sessions/${native.id}`, 'PATCH', {effort:'max'});
+  const waitQuestion = async () => {
+    for(let i=0;i<100;i++) {
+      const result = await b.call(`/api/sessions/${native.id}/interaction`);
+      if(result.request) return result.request;
+      await pause();
+    }
+    throw Error('Native question never reached DO');
+  };
+  const waitNativeDone = async count => {
+    for(let i=0;i<100;i++) {
+      const result = await a.call(`/api/sessions/${native.id}`);
+      if(!result.busy && !result.turnHost && result.events.filter(e=>e.type === 'assistant').length >= count) return result;
+      await pause();
+    }
+    throw Error('Native turn did not finish');
+  };
+  for (let turn=0;turn<2;turn++) {
+    await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask me'});
+    const question = await waitQuestion();
+    assert.equal(question.kind,'question');
+    assert.equal((await b.request(`/api/sessions/${native.id}/interaction`,'POST',{id:question.id,allow:true,answers:{}})).status,400);
+    const answer = {id:question.id,allow:true,answers:{'Which behavior?':'Keep'}};
+    await b.call(`/api/sessions/${native.id}/interaction`,'POST',answer);
+    assert.equal((await a.request(`/api/sessions/${native.id}/interaction`,'POST',answer)).status,409);
+    const saved = await waitNativeDone(turn+1);
+    const reply = JSON.parse(saved.events.findLast(e=>e.type === 'assistant').text);
+    assert.equal(reply.resumed,turn === 1,'native history resumes after the first turn');
+    assert.equal(reply.effort,'max');
+    assert.equal(reply.answer.updatedInput.answers['Which behavior?'],'Keep');
+  }
+  await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask permission'});
+  const permission = await waitQuestion();
+  assert.equal(permission.kind,'permission');
+  const stream = await b.request(`/api/sessions/${native.id}/events`);
+  const interactionReader = stream.body.getReader();
+  const hello = new TextDecoder().decode((await interactionReader.read()).value);
+  assert.ok(hello.includes(permission.id),'reconnected viewer receives the pending request');
+  await b.call(`/api/sessions/${native.id}/interaction`,'POST',{id:permission.id,allow:false});
+  let streamText = hello;
+  while (!streamText.includes('"kind":"done"')) {
+    const chunk = await interactionReader.read();
+    if (chunk.done) break;
+    streamText += new TextDecoder().decode(chunk.value);
+  }
+  await interactionReader.cancel();
+  const liveMessages = streamText.split('\n').filter(line=>line.startsWith('data: ')).map(line=>JSON.parse(line.slice(6)));
+  assert.equal(liveMessages.filter(event=>event.kind === 'delta' && event.delta.kind === 'text').length,1,'partial text is not duplicated by the final native event');
+  const declined = await waitNativeDone(3);
+  assert.equal(JSON.parse(declined.events.findLast(e=>e.type === 'assistant').text).answer.behavior,'deny');
+  await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask again'});
+  await waitQuestion();
+  await b.call(`/api/sessions/${native.id}/stop`,'POST',{});
+  for(let i=0;i<100 && (await a.call(`/api/sessions/${native.id}`)).turnHost;i++) await pause();
+  assert.equal((await a.call(`/api/sessions/${native.id}/interaction`)).request,null,'stop clears pending approval');
+
   await a.call(`/api/sessions/${s.id}`, 'DELETE');
   b.child.kill('SIGTERM');
   await b.closed;
   const unavailable = await a.request(`/api/execution-models?app=__harness&host=${b.status.self}`);
   assert.ok(!unavailable.ok, 'an offline computer never falls back to the serving computer’s models');
+  const offlineApps = await a.call('/api/apps');
+  const remoteProject = offlineApps.apps.find(app=>app.id === sneaker.id);
+  assert.ok(remoteProject,'remote project metadata survives an offline owner');
+  assert.equal(remoteProject.ownerNode,b.status.self);
+  assert.equal(remoteProject.runtimeKnown,false,'local listeners do not establish remote app status');
+
   assert.equal((await unavailable.json()).models, undefined);
   const versionStart = Date.now();
   const offlineVersions = await a.call('/api/harness/versions');

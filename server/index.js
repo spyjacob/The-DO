@@ -152,6 +152,36 @@ async function collectUsage({ force = false } = {}) {
 }
 
 const messageQueue = createMessageQueue();
+const messageAdmissions = new Map();
+const interactionChains = new Map();
+const interactions = new Map(); // Live provider requests; never inferred from assistant prose.
+function requestInteraction(sessionId, request, signal) {
+  const prior = interactionChains.get(sessionId) || Promise.resolve();
+  const pending = prior.catch(() => {}).then(() => presentInteraction(sessionId, request, signal));
+  interactionChains.set(sessionId, pending);
+  pending.finally(() => { if (interactionChains.get(sessionId) === pending) interactionChains.delete(sessionId); }).catch(() => {});
+  return pending;
+}
+function presentInteraction(sessionId, request, signal) {
+  if (signal?.aborted) return Promise.resolve({allow:false, message:'Turn stopped.'});
+  return new Promise(resolve => {
+    const entry = { ...request, id:crypto.randomUUID() };
+    const finish = answer => {
+      signal?.removeEventListener('abort', cancel);
+      if (interactions.get(sessionId)?.request.id === entry.id) interactions.delete(sessionId);
+      broadcast(sessionId, {kind:'interaction', request:null});
+      beacons.touch(sessionId, 'user responded');
+      usageHistory?.record('interaction.finished', {correlationId:entry.id, outcome:answer.allow ? 'approved' : 'declined'});
+      resolve(answer);
+    };
+    const cancel = () => finish({allow:false, message:'Turn stopped.'});
+    interactions.set(sessionId, {request:entry, finish});
+    signal?.addEventListener('abort', cancel, {once:true});
+    broadcast(sessionId, {kind:'interaction', request:entry});
+    usageHistory?.record('interaction.waiting', {correlationId:entry.id, outcome:request.kind});
+  });
+}
+
 const running = new Map();   // sessionId -> { controller, startedAt, last }
 const live = new Map();      // sessionId -> the session object a turn is mutating
 const providerLimits = new Map(); // model alias -> its last reported rate-limit info
@@ -565,9 +595,15 @@ async function dispatchMessage(id, body, reply) {
   }
   // The threshold depends on the backend: an agent CLI legitimately
   // goes quiet for many minutes while running its own loop.
+  const accepted = userEvent(String(text || '').trim(), Array.isArray(atts) ? atts : []);
+  if (body.clientMessageId) accepted.clientMessageId = body.clientMessageId;
+  session.events.push(accepted);
+  try { await store.save(session); }
+  catch (error) { running.delete(id); live.delete(id); return reply(503, {error:error.message}); }
+  broadcast(id, {kind:'event', event:accepted});
   beacons.start(id, { model: session.model, stallMs: stallMsFor(cfg.models[session.model]) });
   reply(200, { ok: true }); // answer now; the work streams over SSE
-  usageHistory?.record('turn.started', { correlationId: body.traceId });
+  usageHistory?.record('turn.started', { correlationId: body.traceId, provider:cfg.models[session.model]?.provider, effort:session.effort || cfg.models[session.model]?.effort || cfg.models[session.model]?.reasoningEffort || 'default' });
   broadcast(id, { kind: 'started', startedAt: turn.startedAt });
 
   let prepared = false, turnFailed = false;
@@ -582,13 +618,16 @@ async function dispatchMessage(id, body, reply) {
     return runTurn({
       session,
       models: cfg.models,
-      userText: text,
+      userText: null,
+      onOutcome: outcome => { turnFailed = outcome === 'error'; },
+      clientMessageId: body.clientMessageId,
+      requestInteraction: (request, signal) => requestInteraction(id, request, signal || controller.signal),
       executionContext: `\n\nJev (TypeSafe) is an optional API integration. Check GET http://127.0.0.1:${PORT}/api/jev for configured status using the same authentication as the activity command. If configured, consider it for classification, routing, ranking and rubric scoring, or when the user requests it. It returns structured decisions, not generated text. POST /api/jev/evaluate on that origin with {state, questions, model?}; model defaults to jev-latest. Read https://docs.typesafe.ai/api for question schemas (noul, choice, score). The server supplies the stored key; never read or copy secrets. Send only task-relevant data, handle uncertain results and failures explicitly, and explain API requirements in app README files. Saving a key does not validate account access. For deployed apps, use their own backend and TYPESAFE_API_KEY; never expose provider keys or Harness credentials in frontend code.\n\nFor optional local GPU helpers, POST JSON {host, action:"catalog"} to /api/cluster/sources to find models with allowDelegate enabled, then POST {host, action:"helper", alias, prompt} to the same authenticated endpoint. Supply only task-relevant text; helpers have no tools. Use the localhost origin and authentication described below. For cross-machine setup diagnostics, GET http://127.0.0.1:${PORT}/api/cluster/status for host IDs, then POST JSON {host, question, useClaude} to http://127.0.0.1:${PORT}/api/machine-help using the same authentication as the activity command below. This returns installation/configuration checks; useClaude asks that computer’s Claude to interpret the snapshot without tools. It cannot inspect arbitrary files or edit another computer.`,
       localModel: async ({ host = cluster.self.id, ...args }) => host === cluster.self.id
         ? sourceAction({ action: 'helper', ...args }) : cluster.hostSources(host, { action: 'helper', ...args }),
       machineHelp: async ({ host, ...request }) => host === cluster.self.id
         ? machineHelp(await loadConfig(USER_DATA), cluster.self, request) : cluster.hostHelp(host, request),
-      attachments: Array.isArray(atts) ? atts : [],
+      attachments: [],
       signal: controller.signal,
       save: async (s) => {
         return store.save(s);
@@ -1065,7 +1104,7 @@ const server = http.createServer(async (req, res) => {
         harnessUpdate,
         default: cfg.default,
         machines: cluster.status(),
-        apps: (await apps.load(USER_DATA)).map(app => ({ id: app.id, name: app.name,
+        apps: (await apps.load(USER_DATA)).map(app => ({ id: app.id, name: app.name, dir:app.dir, ownerNode:app.ownerNode, builtin:app.builtin, runtimeKnown:false,
           executionHosts: executionHosts(app, cluster.replica.members(), cluster.self.id) })),
         error: cfg.error,
         sessions: (await store.list()).filter((x) => !x.id.endsWith('--monitor')),
@@ -1256,7 +1295,7 @@ const server = http.createServer(async (req, res) => {
         // Visibility is not shown in the list (it lives in each app's edit
         // sheet, fetched on demand), so the list does not pay for a gh call
         // per app — that was making the sheet slow to open.
-        const list = await apps.listWithStatus(USER_DATA);
+        const list = await apps.listWithStatus(USER_DATA, cluster.self.id);
         if (cluster.shared()) for (const app of list) if (!app.builtin) app.machines = placement.describe(app);
         return json(res, 200, { apps: list });
       }
@@ -1939,7 +1978,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         // Rooted at home means every project on the machine is in scope, which
         // is never what was wanted and is worth surfacing rather than inferring.
         session.projectDirIsHome = path.resolve(session.projectDir) === path.resolve(os.homedir());
-        return json(res, 200, session);
+        return json(res, 200, { ...session, busy:messageQueue.busy(id) || running.has(id) });
       }
       if (req.method === 'DELETE' && id && !verb) {
         if (running.has(id)) return json(res, 409, { error: 'Stop the turn and wait for it to finish before deleting this session.' });
@@ -1954,6 +1993,11 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const session = live.get(id) ?? (await store.load(id, { repair: !running.has(id) }));
         const patch = await readBody(req);
         if (running.has(id)) return json(res, 409, { error: 'Wait for the current turn and integration to finish before editing this session.' });
+        if (patch.claudePermission !== undefined && !['default','acceptEdits','plan','bypassPermissions'].includes(patch.claudePermission))
+          return json(res, 400, {error:'Invalid Claude permission mode.'});
+        if (patch.effort !== undefined && !['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(patch.effort))
+          return json(res, 400, { error: 'Invalid effort level.' });
+        delete patch.nativeClaude;
         delete patch.queueTurn;
         delete patch.ownerNode;
         delete patch.executionEpoch;
@@ -2040,6 +2084,22 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const { models } = await loadConfig(USER_DATA);
         return json(res, 200, tally(session.events, models));
       }
+      if (id && verb === 'interaction') {
+        const pending = interactions.get(id);
+        if (req.method === 'GET') return json(res, 200, {request:pending?.request || null});
+        if (req.method === 'POST') {
+          const answer = await readBody(req, 65536);
+          if (!pending || pending.request.id !== answer.id) return json(res, 409, {error:'This request has already been answered or stopped.'});
+          if (typeof answer.allow !== 'boolean') return json(res, 400, {error:'Choose approve or decline.'});
+          if (answer.allow && pending.request.kind === 'question') {
+            const questions = pending.request.input.questions || [];
+            if (!answer.answers || questions.some(q => typeof answer.answers[q.question] !== 'string' || !answer.answers[q.question].trim()))
+              return json(res, 400, {error:'Answer each question before continuing.'});
+          }
+          pending.finish({allow:answer.allow, answers:answer.answers});
+          return json(res, 200, {ok:true});
+        }
+      }
       if (id && verb === 'pending') {
         if (req.method === 'GET') return json(res, 200, { pending: messageQueue.pending(id) });
         if (['PATCH', 'DELETE'].includes(req.method)) {
@@ -2072,7 +2132,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         });
         const live = running.get(id);
         res.write(`retry: 2000\n\ndata: ${JSON.stringify({
-          kind: 'hello', pending: messageQueue.pending(id),
+          kind: 'hello', pending: messageQueue.pending(id), interaction: interactions.get(id)?.request || null,
           running: Boolean(live),
           startedAt: live?.startedAt ?? null,
           last: live?.last ?? null,
@@ -2117,9 +2177,29 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         if (restarting) return json(res, 409, { error: 'The server is restarting. Try again when it reconnects.' });
         const body = await readBody(req);
         if ((!body.text || !String(body.text).trim()) && !body.attachments?.length) return json(res, 400, { error: 'Enter a message or attach a file.' });
+        if (body.clientMessageId !== undefined && !/^[a-zA-Z0-9-]{1,100}$/.test(body.clientMessageId))
+          return json(res, 400, {error:'Invalid message ID.'});
+        const key = body.clientMessageId && id + ':' + body.clientMessageId;
         try {
-          const queued = await scheduleTurn(id, { ...body, traceId: requestId }, verb === 'queue');
-          return json(res, queued ? 202 : 200, { ok: true, queued, pending: messageQueue.pending(id) });
+          if (key && messageAdmissions.has(key)) {
+            await messageAdmissions.get(key);
+            return json(res, 200, {ok:true, duplicate:true, pending:messageQueue.pending(id)});
+          }
+          const admit = async () => {
+            if (key) {
+              const existing = live.get(id) || await store.load(id, {repair:false});
+              if (existing.events.some(e => e.clientMessageId === body.clientMessageId)
+                || messageQueue.pending(id).some(e => e.clientMessageId === body.clientMessageId)) return {duplicate:true};
+            }
+            const queued = await scheduleTurn(id, { ...body, traceId: requestId }, verb === 'queue');
+            return {queued};
+          };
+          const operation = admit();
+          if (key) messageAdmissions.set(key, operation);
+          try {
+            const result = await operation;
+            return json(res, result.queued ? 202 : 200, {ok:true, ...result, pending:messageQueue.pending(id)});
+          } finally { if (key && messageAdmissions.get(key) === operation) messageAdmissions.delete(key); }
         } catch (e) { return json(res, 409, { error: e.message }); }
       }
     }
@@ -2295,6 +2375,7 @@ setInterval(() => collectUsage().catch(() => {}), 60_000).unref();
 async function checkForStalls() {
   // Each beacon carries its own threshold; an override applies to all of them.
   const override = process.env.HARNESS_STALL_MS ? Number(process.env.HARNESS_STALL_MS) : undefined;
+  for (const id of interactions.keys()) beacons.touch(id, 'waiting for user');
   const due = beacons.due(override ? { stallMs: override } : {});
   for (const stall of due) {
     const session = live.get(stall.sessionId);

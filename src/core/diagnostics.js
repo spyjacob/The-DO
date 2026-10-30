@@ -37,7 +37,7 @@ export function diagnostics(dir, host, revision) {
     return serial(async () => {
       if (!config.enabled) return;
       const row = { id: crypto.randomUUID(), at: new Date().toISOString(), host, revision, event: safe(event) || 'unknown' };
-      for (const key of ['correlationId','browser','page','device','control','screen','outcome','route','method','peer','leader','role','observedRevision'])
+      for (const key of ['correlationId','browser','page','device','control','screen','outcome','route','method','peer','leader','role','observedRevision','effort','provider'])
         if (safe(details[key])) row[key] = details[key];
       for (const key of ['durationMs','status','width','height','count','conflicts','term','clientAt'])
         if (Number.isFinite(details[key])) row[key] = Math.max(0, Math.min(details[key], 1e15));

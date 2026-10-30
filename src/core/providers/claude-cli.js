@@ -1,19 +1,8 @@
-/**
- * Claude through the local `claude` CLI in print mode.
- *
- * This is the backend to use when you have a Claude subscription but no
- * ANTHROPIC_API_KEY: the CLI already holds your credentials, so the harness
- * borrows nothing and stores nothing. It is the supported headless interface,
- * not a scrape of the keychain.
- *
- * One thing to be clear about, because it changes what a comparison means:
- * Claude Code is a whole agent, not a bare model. It runs its own loop with its
- * own tools, so this backend reports what it *did* rather than asking the
- * harness to run tools on its behalf. Measured against a model driven by the
- * harness's own tools, you are comparing two agents, not two models.
+/** Claude Code through its Agent SDK: native tools, permission callbacks and
+ * resumable local sessions. Canonical DO events remain the portable history.
  */
 
-import spawn from 'cross-spawn';
+import { query } from '@anthropic-ai/claude-agent-sdk';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -45,7 +34,7 @@ export function childEnv(source = process.env, home = os.homedir()) {
 
 export async function complete({
   client, spec, events, system, onText, onThinking, onToolStart, onToolEnd, onStep,
-  onRateLimit, useTools = true, signal, cwd,
+  onRateLimit, useTools = true, signal, cwd, requestInteraction, nativeSession, onNativeSession,
 }) {
   const reply = {
     model: spec.alias,
@@ -58,40 +47,33 @@ export async function complete({
     usage: { input: 0, output: 0, cached: 0, ms: 0 },
   };
 
-  const args = [
-    '--print',
-    '--output-format', 'stream-json',
-    '--verbose',
-    '--permission-mode', spec.permissionMode || 'bypassPermissions',
-    ...(spec.model ? ['--model', spec.model] : []),
-    ...(spec.effort ? ['--effort', spec.effort] : []),
-    ...(spec.maxTurns ? ['--max-turns', String(spec.maxTurns)] : []),
-    ...(system ? ['--append-system-prompt', system] : []),
-    ...(useTools ? [] : ['--tools', '']),   // chat mode: no tools at all
-  ];
-
   const started = Date.now();
-  const child = spawn(client.bin, args, { cwd, env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
-
-  const abort = () => child.kill('SIGTERM');
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
   signal?.addEventListener('abort', abort, { once: true });
-
-  // The whole transcript goes in as one prompt. Re-sending it each turn is what
-  // lets a session move between providers with its history intact.
-  // Trim only to avoid exceeding the context window — never to save tokens.
-  // Room is still left for what the harness does not control: Claude Code's own
-  // system prompt, its tool definitions, and the reply itself.
   const contextTokens = spec.contextTokens ?? 1_000_000;
-  const share = spec.contextShare ?? 0.75;
-  child.stdin.end(renderForPrompt(events, { budgetChars: Math.floor(contextTokens * share * 3.5) }));
+  const prompt = nativeSession
+    ? renderForPrompt([events.findLast(e => e.type === 'user')].filter(Boolean))
+    : renderForPrompt(events, { budgetChars: Math.floor(contextTokens * (spec.contextShare ?? .75) * 3.5) });
 
   const names = new Map(); // tool_use id -> name, to label the results
   let stderr = '';
-  let buf = '';
+  let partialText = false, partialThinking = false;
 
-  const handle = (line) => {
-    let d;
-    try { d = JSON.parse(line); } catch { return; }
+
+  const handle = (d) => {
+    if (d.type === 'stream_event') {
+      const event = d.event;
+      if (event?.type === 'message_start') { partialText = false; partialThinking = false; }
+      if (event?.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        partialText = true; onText?.(event.delta.text || '');
+      }
+      if (event?.type === 'content_block_delta' && event.delta?.type === 'thinking_delta') {
+        partialThinking = true; onThinking?.(event.delta.thinking || '');
+      }
+      return;
+    }
 
     if (d.type === 'system' && d.model) reply.servedModel = d.model;
 
@@ -99,8 +81,8 @@ export async function complete({
       if (d.message.model) reply.servedModel = d.message.model;
       const step = { kind: 'assistant', servedModel: reply.servedModel, text: '', thinking: '', toolCalls: [], usage: {} };
       for (const b of d.message.content ?? []) {
-        if (b.type === 'text') { step.text += b.text; reply.text += b.text; onText?.(b.text); }
-        else if (b.type === 'thinking') { step.thinking += b.thinking ?? ''; onThinking?.(b.thinking ?? ''); }
+        if (b.type === 'text') { step.text += b.text; reply.text += b.text; if (!partialText) onText?.(b.text); }
+        else if (b.type === 'thinking') { step.thinking += b.thinking ?? ''; if (!partialThinking) onThinking?.(b.thinking ?? ''); }
         else if (b.type === 'tool_use') {
           names.set(b.id, b.name);
           const call = { id: b.id, name: b.name, args: b.input ?? {} };
@@ -178,21 +160,37 @@ export async function complete({
     }
   };
 
-  child.stdout.on('data', (chunk) => {
-    buf += chunk;
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';
-    for (const l of lines) if (l.trim()) handle(l);
-  });
-  child.stderr.on('data', (c) => { stderr += c; });
-
-  const code = await new Promise((resolve) => {
-    child.on('error', (e) => { reply.error = `could not run "${client.bin}": ${e.message}`; resolve(-1); });
-    child.on('close', resolve);
-  });
-
-  signal?.removeEventListener('abort', abort);
-  if (buf.trim()) handle(buf);
+  let code = 0;
+  try {
+    const stream = query({ prompt, options: {
+      cwd, env: childEnv(), abortController: controller, includePartialMessages:true,
+      ...(client.bin !== 'claude' ? { pathToClaudeCodeExecutable: client.bin } : {}),
+      ...(spec.model ? {model: spec.model} : {}),
+      ...(spec.effort ? {effort: spec.effort} : {}),
+      ...(spec.maxTurns ? {maxTurns: spec.maxTurns} : {}),
+      ...(nativeSession ? {resume: nativeSession} : {}),
+      systemPrompt: {type:'preset', preset:'claude_code', append:system || ''},
+      settingSources: ['user', 'project', 'local'],
+      permissionMode: spec.permissionMode || 'default',
+      allowDangerouslySkipPermissions: spec.permissionMode === 'bypassPermissions',
+      ...(!useTools ? {tools:[]} : {}),
+      stderr: text => { stderr = (stderr + text).slice(-4000); },
+      canUseTool: async (tool, input, options) => {
+        if (!requestInteraction) return {behavior:'deny', message:'This invocation has no interactive approval surface.'};
+        const answer = await requestInteraction({tool, input, kind:tool === 'AskUserQuestion' ? 'question' : 'permission'}, options.signal);
+        if (!answer.allow) return {behavior:'deny', message:answer.message || 'User declined this request.'};
+        return {behavior:'allow', updatedInput: tool === 'AskUserQuestion' ? {...input, answers:answer.answers} : input};
+      },
+    }});
+    for await (const message of stream) {
+      if (message.type === 'system' && message.subtype === 'init' && message.session_id)
+        await onNativeSession?.(message.session_id);
+      handle(message);
+    }
+  } catch (error) {
+    code = 1;
+    reply.error = signal?.aborted ? 'stopped by user' : error.message;
+  } finally { signal?.removeEventListener('abort', abort); }
 
   reply.usage.ms = Date.now() - started;
   if (code !== 0 && !reply.error) {

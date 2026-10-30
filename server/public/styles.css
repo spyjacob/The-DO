@@ -806,3 +806,7 @@ button.primary.danger:active { background: #db5f78; }
 
 .pending-stack { max-height: min(240px, 22dvh); overflow-y: auto; overscroll-behavior: contain; }
 .pending-row { padding: 8px 0; border-top: 1px solid var(--line); }
+
+#provider-interaction { max-height: 45dvh; overflow:auto; padding: 8px 12px; background:var(--bg-3); border:1px solid var(--line); border-radius:12px; overflow-wrap:anywhere; }
+#provider-interaction summary { min-height:44px; align-content:center; cursor:pointer; }
+#provider-interaction textarea { width:100%; min-height:70px; box-sizing:border-box; }

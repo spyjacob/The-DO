@@ -624,7 +624,7 @@ function httpReachable(port) {
   });
 }
 
-export async function listWithStatus(userDataDir) {
+export async function listWithStatus(userDataDir, localNode) {
   // All four at once. They are independent - a registry read, a tailnet
   // lookup and two shell-outs - and run one after another they were most of
   // the wait before the apps sheet could draw anything.
@@ -633,6 +633,8 @@ export async function listWithStatus(userDataDir) {
   ]);
 
   return Promise.all(apps.map(async (app) => {
+    if (localNode && app.ownerNode && app.ownerNode !== localNode && !app.builtin)
+      return {...app, running:false, reachable:false, runtimeKnown:false, urls:{phone:null,desktop:null}};
     // A listener alone is not an app: chats can run temporary download servers.
     const info = app.hasBeenApp
       ? runningInfo(app, procs, apps)

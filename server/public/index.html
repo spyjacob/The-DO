@@ -33,7 +33,7 @@
 
     <div id="working" hidden>
       <span class="pulse"></span>
-      <span>working</span>
+      <span id="working-label">working</span>
       <span id="working-time" class="mono"></span>
     </div>
 
@@ -49,6 +49,7 @@
 
     <footer id="composer">
       <div id="composer-message">
+        <section id="provider-interaction" hidden aria-live="polite"></section>
         <section id="message-pending" hidden aria-live="polite"></section>
         <textarea id="input" rows="1" placeholder="Describe what to build…" enterkeyhint="send"></textarea>
       </div>

@@ -155,3 +155,70 @@ or `error`. Frame load only confirms navigation, not successful rendering of a
 cross-origin app. Reproduce from a running project's layout links, switch sizes,
 then open a stopped project's preview to exercise the error path. Events use the
 same bounded diagnostics storage and authenticated APIs described above.
+
+
+## Hardening pass: provider interaction and delivery
+
+Claude's existing `claude-cli` source identifier now uses the locked Agent SDK,
+its Claude Code system-prompt preset, and user/project/local settings sources.
+It retains configured model, effort, explicit maxTurns and permissionMode.
+Default permissions now ask when needed instead of bypassing permissions.
+Existing explicitly configured bypassPermissions remains an explicit override.
+No new API key is required; authentication remains on the execution host.
+Custom `bin` paths are passed to the SDK as the executable override.
+
+`AskUserQuestion` and permission callbacks wait for an authenticated response
+through `/api/sessions/:id/interaction`. SSE hello includes the outstanding
+request, so reconnecting or viewing from another host does not lose it. Responses
+are bound to a request ID, accepted once, and rejected if stale. Stop cancels the
+request. Concurrent native requests are presented in order. Waiting for a user
+is excluded from stall alarms. Requests are not durable executable jobs: a host
+process crash ends the turn rather than silently granting a pending permission.
+The SDK stores its native history locally; DO stores a native session ID and a
+transcript fingerprint. Unchanged history resumes only on the same owner, model
+alias and working directory. Edited history uses canonical transcript replay.
+
+API turns no longer stop after 40 steps. The second model call that manufactured
+a closing summary was removed. Provider response limits, explicitly configured
+limits, context windows and cancellable tool timeouts still apply. Requested
+reasoning is never silently retried as `none`. Provider failures and response
+truncation are recorded as errors, not successful task completion.
+
+Messages have client IDs and are persisted before acknowledgement. Duplicate
+submissions resolve to their existing acceptance on the session owner. Browser
+reconciliation retains provisional messages until the matching saved event
+arrives; saved events are deduplicated, and stale HTTP queue replies cannot
+overwrite newer SSE queue state. Native event saves drain in order before a turn
+finishes. This does not make queued follow-ups durable across process restarts;
+that remains an explicit limitation of the existing queue.
+
+Project status probes no longer attribute a local port or process to another
+host's app. The replicated metadata supplies the initial project list even when
+runtime-status refresh fails. Offline ownership is visible, and saved remote
+chats remain selectable. Live remote application start/stop routing still needs
+its own owner-host protocol; this pass does not claim that local runtime probes
+establish remote availability.
+
+The old service-worker shell cache was removed. Activation deletes only
+`orchestrator-shell-*` caches. No fetch interception or offline shell remains;
+server no-store responses and browser network errors are authoritative. This
+prevents old/new asset combinations, but does not establish the exact cause of
+the earlier Safari incident. Existing pages need reload after restart.
+
+Diagnostics continue through the documented host-local API. `turn.started`
+records provider and requested effort; `interaction.waiting` and
+`interaction.finished` share a request correlation ID. The browser records
+`provider-request` visible states without questions, command contents or answers.
+To reproduce: start a Claude turn requiring a question or permission, reconnect
+from another viewer, answer/decline, then repeat and press Stop. Check both the
+visible request and the host's interaction outcome. Never infer task completion
+from a successful model response alone.
+
+Validation covers the real two-server HTTP/SSE routes and the installed Agent
+SDK with a deterministic CLI control-protocol fixture, including native resume,
+effort, answers, declines, stale responses, reconnects and cancellation. API tests
+exercise 41 tool steps and effort rejection. Browser checks use fictional data at
+390px and 1120px. A paid live Claude run and a live second-machine rollout have
+not been performed. Codex app-server integration, durable queued messages, and
+conflict-safe partition reconciliation remain follow-up architectural work;
+unrelated used features were preserved rather than removed speculatively.

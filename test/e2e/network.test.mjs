@@ -81,6 +81,39 @@ try {
   vm.runInContext(previewSource, preview);
   await pause(10);
   assert.match(element('preview-status').textContent, /Phone access address/);
+  // Drive the served connection gate against this server, then a stalled phone request.
+  const frontend = await (await request('/app.js')).text();
+  const gateElements = new Map();
+  const gateElement = id => {
+    if (!gateElements.has(id)) gateElements.set(id, {id, hidden:false});
+    return gateElements.get(id);
+  };
+  let hangProbe = false, deadline, initializations = 0;
+  const gateUi = vm.createContext({
+    AbortController, clearTimeout() {}, setTimeout: fn => { deadline = fn; return 1; }, setInterval() {},
+    document: {body:{children:[gateElement('network-gate'),gateElement('composer')]}},
+    $:gateElement, window:{addEventListener() {}, harnessTrace() {}}, showBanner() {},
+    initializeApp: async () => { initializations++; throw Error('Chat could not open'); },
+    nativeFetch: (route, options) => {
+      assert.equal(route, '/api/network', 'probe must stay on the serving host');
+      if (hangProbe) return new Promise((resolve,reject) => options.signal.addEventListener('abort',()=>reject(Error('timeout'))));
+      return request(route);
+    },
+  });
+  vm.runInContext(frontend.slice(frontend.indexOf('let networkChecking ='),frontend.indexOf('// Runtime status is always')), gateUi);
+  for(let i=0;i<50 && !gateElement('network-gate').hidden;i++) await pause(20);
+  assert.equal(gateElement('network-gate').hidden,true);
+  assert.equal(initializations,1,'chat failure must not become a network failure');
+  hangProbe = true;
+  const stalled = gateUi.checkNetworkConnection();
+  deadline();
+  await stalled;
+  assert.equal(gateElement('network-gate-title').textContent,'Waiting for Harness');
+  hangProbe = false;
+  await gateUi.checkNetworkConnection();
+  assert.equal(gateElement('network-gate').hidden,true,'timed out probe releases retry lock');
+  assert.equal(gateElement('composer').inert,false);
+
   const sources = async body => {
     const response = await fetch(`http://127.0.0.1:${port}/api/cluster/sources`, {
       method: 'POST', headers: { 'x-harness-token': 'network-test', 'Content-Type': 'application/json' }, body: JSON.stringify(body),

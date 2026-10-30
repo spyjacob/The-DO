@@ -72,13 +72,8 @@ export async function complete({
       // user edit config, swap to it and try once more.
       const msg = e?.message ?? '';
 
-      // Some models refuse tools and reasoning together on this endpoint and
-      // say so. Honour the instruction rather than failing the turn.
-      if (/reasoning_effort/.test(msg) && body.reasoning_effort !== 'none') {
-        body.reasoning_effort = 'none';
-        reply.retriedWith = "reasoning_effort='none'";
-        stream = await client.chat.completions.create(body, signal ? { signal } : undefined);
-      } else {
+      // Never silently disable requested reasoning. Surface unsupported settings.
+      {
         const swap = /max_completion_tokens/.test(msg) ? 'max_completion_tokens'
           : /'max_tokens'/.test(msg) ? 'max_tokens'
             : null;

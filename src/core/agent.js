@@ -7,12 +7,12 @@
  * with the whole history intact.
  */
 
+import crypto from 'node:crypto';
 import { toBase64, toDataUrl } from './attachments.js';
 import { clientFor, providerFor } from './providers/index.js';
 import { runTool } from './tools.js';
 import { assistantEvent, noteEvent, toolResultEvent, userEvent } from './transcript.js';
 
-const MAX_STEPS = 40;
 
 /**
  * Run a tool, but never wait on it forever.
@@ -76,7 +76,7 @@ Serving an app the user can open from their phone:
   Both are needed. Loopback works on the host even when a custom userspace Tailscale daemon cannot resolve its own tailnet hostname.
 - Leave the app running in the background so it stays reachable after your turn ends.
 - Do not narrate routine tool calls blow by blow, but always finish with the outcome.
-- End every turn with the state of things, in the past tense: what is now true, what you changed, and whether the user can use it. Do not end mid-stride with what you are "now doing" - your turn is over when you stop, so a message written as though work continues tells the user the opposite of the truth. If something is genuinely unfinished, say what remains and that you have stopped.`;
+- Follow the user’s intent: perform authorized work, answer questions directly, or ask for missing information when needed. State what changed and how it was verified when you made changes. A clarification question is a valid turn outcome; never invent a completion summary or claim unfinished work is done.`;
 
 const MONITORING = `Monitoring (the user watches this from their phone):
 - If you start long-running or background work, redirect its output to a log file so it can be followed.
@@ -150,7 +150,7 @@ const PROJECT_TRACING = [
   '- Verify tracing with a representative user flow, including an error path, so another assistant can follow action → visible result → underlying cause. Keep the normal interface simple; do not make the user collect or interpret routine debugging logs.',
 ].join('\n');
 
-export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost = null) {
+export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost = null, native = false) {
   if (!usesTools(session)) {
     return session.system?.trim() ? `${CHAT_SYSTEM}\n\n${session.system.trim()}` : CHAT_SYSTEM;
   }
@@ -158,8 +158,8 @@ export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost 
   // The machine's own tailnet name is substituted here rather than written
   // into the source: it is this user's infrastructure, not part of the tool.
   const base = BASE_SYSTEM.replace(/TAILNET_HOST/g, tailnetHost ?? '<this machine>.ts.net');
-  const parts = [base, PROJECT_TRACING, `\nProject directory: ${session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir}`,
-    process.platform === 'win32' ? 'Execution host: native Windows. Shell commands use cmd.exe; use Windows paths and commands, or invoke PowerShell explicitly. Do not assume WSL or Unix tools.' : `Execution host: ${process.platform}.`];
+  const parts = [base, ...(native ? ['Use your native tools, planning and clarification behavior. Native permission requests and AskUserQuestion are relayed through DO to the user; use them when needed.'] : []), PROJECT_TRACING, `\nProject directory: ${session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir}`,
+    process.platform === 'win32' && !native ? 'Execution host: native Windows. Shell commands use cmd.exe; use Windows paths and commands, or invoke PowerShell explicitly. Do not assume WSL or Unix tools.' : `Execution host: ${process.platform}.`];
   if (session.tabWorkspace) parts.push('This tab has an isolated Git worktree. Work only in the project directory above, even if older messages name a different directory. Do not switch branches, push, or edit the shared checkout or other worktrees. Install dependencies locally when needed. Changes stay in this tab until the user presses Push in the frontend. That operation fetches remote changes, merges, runs integration checks, and publishes. Never push automatically after a turn. If integration reports a conflict, resolve it here in a subsequent turn. Changes are not live until integration succeeds.');
   if (session.appId && session.appId !== '__harness') parts.push(`When this app itself uses AI at runtime, record its dependency via PATCH /api/apps/${session.appId} with aiDependencies: [{host, alias, label, purpose}]. Discover exact host IDs and source aliases via /api/cluster/status and /api/cluster/sources catalog. Preserve existing dependencies when updating. Record only sources actually configured in the app, never the coding assistant merely building it. Do not put credentials in metadata. Implement runtime model selection by reading HARNESS_APP_AI (JSON array of purpose, provider, model, alias, host) provided at app launch. Support only provider adapters actually implemented; reject unsupported replacements with an actionable error. Document AI requirements and how to use personal credentials in README.md. Never claim metadata alone changes a hard-coded integration. Explain if registration is unavailable.`);
   if (monitorsFile) {
@@ -187,9 +187,9 @@ export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost 
   } else {
     parts.push('\nYou run inside a harness. The harness\'s own files are read-only to you: you may look at them, but any attempt to write there is refused, and that is deliberate rather than a fault to work around.');
   }
-  parts.push('You can email the user with send_email when something needs them and they may not be watching — a long run finished, a decision is needed, or work failed in a way you cannot resolve. Do not email for routine progress.');
+  if (!native) parts.push('You can email the user with send_email when something needs them and they may not be watching — a long run finished, a decision is needed, or work failed in a way you cannot resolve. Do not email for routine progress.');
   if (session.confineToProjectDir) {
-    parts.push('File tools are confined to this directory; paths outside it are refused.');
+    parts.push(native ? 'This project folder is the default scope. If the user’s task needs additional folders or host actions, request the required native permission; do not claim the task is impossible merely because it needs broader scope.' : 'File tools are confined to this directory; paths outside it are refused.');
     parts.push('This session is its own project. Other work on this machine is not yours to read or reason about, even if you can see it — do not go looking through other directories for context, and do not assume another project\'s files are related to this one. If you need something from elsewhere, ask.');
     if (session.readableDirs?.length) {
       parts.push(`You may also READ from these folders, but not write to them:\n${
@@ -209,78 +209,17 @@ export function systemPromptFor(session, monitorsFile, activityCmd, tailnetHost 
  * @param onDelta  called with live streaming updates that are not persisted
  * @param save     persists the session; awaited after every appended event
  */
-/**
- * The turn-end guard.
- *
- * The system prompt asks every session to finish in the past tense with what is
- * now true. Asking is not enforcing: a turn that runs out of steps, or whose
- * backend simply stops talking, ends on a tool result and reads as "finished,
- * said nothing" — which is how a cut-off turn passes for a complete one. So the
- * boundary is checked, and a turn that produced no closing words is given one
- * bounded, tool-free call to write them.
- *
- * One call, never a loop: if the model cannot summarise its own work in a
- * single pass, saying so plainly is better than spending the user's turn on it.
- */
+// Native agents own their stopping and clarification behavior. Never manufacture
+// a final answer with a second, tool-free model call.
 export async function runTurn(opts) {
-  const before = opts.session.events.length;
-  await runTurnInner(opts);
-  try {
-    await closeOutTurn(opts, before);
-  } catch (e) {
-    // A missing summary is a blemish; a guard that throws would lose the turn.
-    opts.session.events.push(noteEvent(`turn-end guard: ${e?.message ?? e}`));
-    await opts.save(opts.session);
-  }
-}
-
-/** Did this turn end with the model actually saying something? */
-function endedWithWords(events, from) {
-  for (let i = events.length - 1; i >= from; i -= 1) {
-    const e = events[i];
-    if (e.type === 'assistant' && (e.text ?? '').trim()) return true;
-    // A note means the turn ended for a reason already recorded — stopped by
-    // the user, a model error, an interrupted harness. Those explain
-    // themselves; adding a summary on top would be noise.
-    if (e.type === 'note') return true;
-  }
-  return false;
-}
-
-async function closeOutTurn(opts, before) {
-  const { session, models, save, signal, onEvent, onDelta } = opts;
-  if (signal?.aborted) return;
-  if (session.events.length === before) return;      // nothing happened at all
-  if (endedWithWords(session.events, before)) return;
-
-  const spec = models[session.model];
-  if (!spec) return;
-
-  const reply = await providerFor(spec).complete({
-    client: clientFor(spec),
-    spec,
-    events: session.events,
-    system: 'Your turn is ending. In a few sentences, in the past tense, say what you did, '
-      + 'what is now true, and whether the user can use it. If something is unfinished, say what '
-      + 'remains and that you have stopped. Do not start new work and do not ask to continue.',
-    useTools: false,
-    onText: (text) => onDelta?.({ kind: 'text', text }),
-    signal,
-    cwd: session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir,
-  });
-
-  const text = (reply.text ?? '').trim();
-  if (!text) return;
-  const event = assistantEvent({ ...reply, text, toolCalls: [] });
-  event.closedByGuard = true;     // so the UI can say where this came from
-  session.events.push(event);
-  await save(session);
-  onEvent?.(event);
+  const result = await runTurnInner(opts);
+  opts.onOutcome?.(result?.outcome || (opts.signal?.aborted ? 'cancelled' : 'responded'));
+  return result;
 }
 
 async function runTurnInner({
   session, models, userText, attachments, onEvent, onDelta, save, signal, monitorsFile, activityCmd,
-  tailnetHost = null, executionContext = '', machineHelp, localModel,
+  tailnetHost = null, executionContext = '', machineHelp, localModel, requestInteraction, clientMessageId,
 }) {
   const append = async (event) => {
     session.events.push(event);
@@ -291,19 +230,21 @@ async function runTurnInner({
 
   if (userText?.trim() || attachments?.length) {
     const event = userEvent(userText?.trim() ?? '', attachments ?? []);
+    if (clientMessageId) event.clientMessageId = clientMessageId;
     await append(event);
   }
 
-  for (let step = 0; step < MAX_STEPS; step += 1) {
+  for (;;) {
     if (signal?.aborted) {
       await append(noteEvent('stopped by user'));
       return;
     }
 
-    const spec = models[session.model];
+    const configured = models[session.model];
+    const spec = configured && { ...configured, ...(session.claudePermission ? {permissionMode:session.claudePermission} : {}), ...(session.effort ? { effort: session.effort, reasoningEffort: session.effort } : {}) };
     if (!spec) {
       await append(noteEvent(`model "${session.model}" is not in models.json`));
-      return;
+      return {outcome:'error'};
     }
 
     // Images are stored as files and only turned into base64 for the providers
@@ -324,8 +265,17 @@ async function runTurnInner({
       )));
     }
 
+    // Resume only an unchanged transcript on the same execution host/folder/model.
+    // Editing history or changing providers deliberately starts a fresh native session.
+    const fingerprint = entries => crypto.createHash('sha256').update(JSON.stringify(entries.filter(e => ['user','assistant','tool_result'].includes(e.type)).map(e => [e.id,e.text,e.toolCalls,e.output]))).digest('hex');
+    const cwd = session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir;
+    const native = session.nativeClaude;
+    const resume = spec.provider === 'claude-cli' && native?.host === session.ownerNode && native?.cwd === cwd && native.model === session.model
+      && native.history === fingerprint(session.events.filter(e => ['user','assistant','tool_result'].includes(e.type)).slice(0, -1)) ? native.id : null;
+    let nativeId;
     let reply;
     let streamed = 0;
+    let stepSaves = Promise.resolve();
     const appendStep = async (st) => {
       streamed += 1;
       if (st.kind === 'tool_result') await append(toolResultEvent(st));
@@ -336,18 +286,22 @@ async function runTurnInner({
       const provider = providerFor(spec);
       reply = await provider.complete({
         client: clientFor(spec),
+        requestInteraction,
+        nativeSession: resume,
+        onNativeSession: id => { nativeId = id; },
         spec,
         events,
-        system: systemPromptFor(session, monitorsFile, activityCmd, tailnetHost) + (executionContext ? `\n\n${executionContext}` : ''),
+        system: systemPromptFor(session, monitorsFile, activityCmd, tailnetHost, spec.provider === 'claude-cli') + (executionContext ? `\n\n${executionContext}` : ''),
         onText: (text) => onDelta?.({ kind: 'text', text }),
         onThinking: (text) => onDelta?.({ kind: 'thinking', text }),
         onToolStart: (call) => onDelta?.({ kind: 'tool_start', call }),
         onToolEnd: (result) => onDelta?.({ kind: 'tool_end', result }),
-        // Providers fire this without awaiting it, so a failed save (e.g. the
-        // coordinator changed mid-turn) would be an unhandled rejection and kill
-        // the server. The event is already in session.events; the next save
-        // persists it.
-        onStep: (st) => appendStep(st).catch((e) => console.warn(`step not saved: ${e?.message ?? e}`)),
+        // Providers stream without awaiting saves. Preserve order and drain all
+        // writes before reporting completion; surface a persistence failure.
+        onStep: (st) => {
+          stepSaves = stepSaves.then(() => appendStep(st));
+          stepSaves.catch(() => {}); // awaited before the turn may finish
+        },
         onRateLimit: (info) => onDelta?.({ kind: 'rate_limit', info }),
         useTools: usesTools(session),
         longContext: Boolean(session.allowLongContext),
@@ -355,8 +309,15 @@ async function runTurnInner({
         cwd: session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir,
       });
     } catch (e) {
+      await stepSaves;
       await append(noteEvent(`${spec.alias}: ${e?.message ?? String(e)}`));
-      return;
+      return {outcome:'error'};
+    }
+
+    await stepSaves;
+    if (nativeId && !reply.error) {
+      session.nativeClaude = {id:nativeId, cwd, host:session.ownerNode, model:session.model, history:fingerprint(session.events)};
+      await save(session);
     }
 
     // Some backends are whole agents (the `claude` CLI) and have already run
@@ -381,14 +342,18 @@ async function runTurnInner({
       }
 
       if (reply.error) await append(noteEvent(`${spec.alias}: ${reply.error}`));
-      return;
+      return {outcome:reply.error ? 'error' : 'responded'};
     }
 
     const event = await append(assistantEvent(reply));
 
     if (reply.error) {
       await append(noteEvent(`${spec.alias}: ${reply.error}`));
-      return;
+      return {outcome:'error'};
+    }
+    if (['length','max_tokens'].includes(reply.stopReason)) {
+      await append(noteEvent('The provider reached its response token limit. This turn was cut short; the work may be unfinished.'));
+      return {outcome:'error'};
     }
     if (!event.toolCalls.length) return; // the model is done talking
 
@@ -419,5 +384,5 @@ async function runTurnInner({
     }
   }
 
-  await append(noteEvent(`stopped after ${MAX_STEPS} steps - send another message to continue`));
+
 }
