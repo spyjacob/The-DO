@@ -81,6 +81,17 @@ export function createAISources(dir, { request = fetch, discoverClaude = claudeM
         }
       }
       models = [...new Map(models.filter(m => typeof m.model === 'string' && m.model).map(m => [m.model, m])).values()];
+      // Refresh capabilities of already installed rows too; never change their chosen effort.
+      await mutate(raw => {
+        for (const spec of Object.values(raw.models || {})) {
+          if ((spec.sourceKind || spec.provider) !== kind) continue;
+          const model = models.find(m => m.model === spec.model);
+          if (!model) continue;
+          for (const key of ['supportsEffort','supportedEffortLevels','defaultEffort','effortSource']) {
+            if (model[key] === undefined) delete spec[key]; else spec[key] = model[key];
+          }
+        }
+      });
       discoveries.set(kind, { models, at: Date.now() });
       return { kind, models, message: models.length ? 'Models reported by this source. Add the ones you want; account limits still apply.' : 'No text models found. Install or download a model, then refresh.' };
     },
@@ -100,7 +111,7 @@ export function createAISources(dir, { request = fetch, discoverClaude = claudeM
           const alias = Object.keys(raw.models).find(id => raw.models[id].sourceKind === kind && raw.models[id].model === m.model)
             || 'source-' + crypto.randomUUID();
           raw.models[alias] = { ...raw.models[alias], sourceKind: kind, provider: kind === 'ollama' ? 'openai' : kind,
-            model: m.model, label: m.label, ...(kind === 'ollama' ? { baseUrl: OLLAMA + '/v1', apiKeyOptional: true,
+            model: m.model, label: m.label, supportsEffort:m.supportsEffort, supportedEffortLevels:m.supportedEffortLevels, defaultEffort:m.defaultEffort, effortSource:m.effortSource, ...(kind === 'ollama' ? { baseUrl: OLLAMA + '/v1', apiKeyOptional: true,
               supportsTools: m.tools, allowDelegate: allowDelegate === true, priceIn: 0, priceOut: 0 } : {}) };
           aliases.push(alias);
         }

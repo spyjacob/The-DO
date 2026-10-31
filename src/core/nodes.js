@@ -71,7 +71,7 @@ export function createNodes(dir, { request = fetch } = {}) {
       }
       const target = new URL(node.url);
       const headers = { 'x-harness-token': node.token };
-      for (const name of ['content-type', 'content-length', 'x-filename', 'accept', 'accept-encoding', 'range']) {
+      for (const name of ['content-type', 'content-length', 'x-filename', 'accept', 'accept-encoding', 'range', 'x-harness-trace', 'x-harness-session']) {
         if (req.headers[name]) headers[name] = req.headers[name];
       }
       const safeRoute = new URL(route, 'http://node.invalid');
@@ -82,7 +82,7 @@ export function createNodes(dir, { request = fetch } = {}) {
       }, (reply) => {
         clearTimeout(timer);
         const responseHeaders = {};
-        for (const name of ['content-type', 'content-length', 'content-encoding', 'content-disposition', 'cache-control', 'vary']) {
+        for (const name of ['content-type', 'content-length', 'content-encoding', 'content-disposition', 'cache-control', 'vary', 'content-security-policy', 'x-content-type-options']) {
           if (reply.headers[name]) responseHeaders[name] = reply.headers[name];
         }
         res.writeHead(reply.statusCode, responseHeaders);

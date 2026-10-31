@@ -53,7 +53,14 @@ const cur = () => tabs[state.tab];
 // so a failed conversion is visible before you commit to the message.
 let pendingShots = [];
 
-const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// URLs in attributes need a scheme policy as well as HTML escaping.
+const safeHref = value => {
+  const text = String(value ?? '');
+  if (/^https?:\/\//i.test(text) && !/[\u0000-\u0020\u007f]/.test(text)) return esc(text);
+  return '#';
+};
 
 /**
  * Enough markdown to read like prose rather than source. Headings, bold, lists, tables
@@ -150,7 +157,7 @@ function emphasis(t) {
         return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
       }
       if (href.startsWith('/')) {
-        return `<a href="${nodeApi('/api/file')}?path=${encodeURIComponent(href)}&session=${encodeURIComponent(state.session?.id || '')}" target="_blank" rel="noopener">${label}</a>`;
+        return `<a href="${nodeApi('/api/file')}?path=${encodeURIComponent(href.replace(/&(amp|lt|gt|quot|#39);/g, (_, entity) => ({amp:'&',lt:'<',gt:'>',quot:'"','#39':"'"}[entity])))}&session=${encodeURIComponent(state.session?.id || '')}" target="_blank" rel="noopener">${label}</a>`;
       }
       return label;   // relative or unknown: show the words, drop the link
     })
@@ -472,7 +479,7 @@ function messageToggle(key, label) {
 function turnCommitLink(turn) {
   const note = [...(turn.notes || [])].reverse().find(n =>
     /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/commit\/[a-f0-9]{7,40}$/i.test(n.commitUrl || ''));
-  return note ? `<a class="turn-commit" href="${esc(note.commitUrl)}" target="_blank" rel="noopener noreferrer" aria-label="View this turn’s commit on GitHub">Published ${esc((note.sha || '').slice(0, 8))} · ${clock(note.ts)} ↗</a>` : '';
+  return note ? `<a class="turn-commit" href="${safeHref(note.commitUrl)}" target="_blank" rel="noopener noreferrer" aria-label="View this turn’s commit on GitHub">Published ${esc((note.sha || '').slice(0, 8))} · ${clock(note.ts)} ↗</a>` : '';
 }
 
 function turnHtml(turn, i, running, number, isLast) {
@@ -632,7 +639,7 @@ async function openSession(id, { startup = false } = {}) {
   const meta = state.sessions.find((x) => x.id === id);
   if (meta) {
     $('title-name').textContent = state.apps?.find((a) => a.id === meta.appId)?.name || 'Distributed Orchestrator';
-    $('title-sub').textContent = `Model: ${state.models[meta.model]?.label || meta.model}`;
+    $('title-sub').textContent = modelEffortLabel(meta);
   }
   window.harnessTrace?.('visible', { screen: 'transcript', outcome: 'loading' });
   $('transcript').innerHTML = '<div class="empty"><p class="dim">loading…</p></div>';
@@ -718,7 +725,8 @@ function nextTabName(appId) {
 
 function projectSession(app) {
   const sessions = state.sessions.filter((s) => s.appId === app.id).sort((a,b) => Number(sessionOffline(a)) - Number(sessionOffline(b)));
-  const remembered = sessionStorage.getItem(`${sessionStorageKey}:app:${app.id}`);
+  let remembered;
+  try { remembered = sessionStorage.getItem(`${sessionStorageKey}:app:${app.id}`); } catch {}
   return sessions.find((s) => s.id === state.session?.id)
     || sessions.find((s) => s.id === remembered) || sessions[0];
 }
@@ -841,7 +849,7 @@ function paintHeader() {
   const t = cur();
   $('title-name').textContent = state.apps?.find((a) => a.id === s?.appId)?.name || 'Distributed Orchestrator';
   $('title-sub').textContent = s
-    ? `Model: ${state.models[s.model]?.label || s.model} · effort: ${s.effort || state.models[s.model]?.effort || state.models[s.model]?.reasoningEffort || 'provider default'}`
+    ? modelEffortLabel(s)
     : 'pick a session';
   $('send').disabled = !t.session || sessionOffline(t.session);
   $('input').placeholder = idlePlaceholder();
@@ -861,7 +869,7 @@ function paintHeader() {
 }
 
 function showBanner(msg, warn = false) {
-  window.harnessTrace?.('visible', { screen: 'banner', outcome: msg ? 'error' : 'cleared' });
+  window.harnessTrace?.('visible', { screen: 'banner', outcome: msg ? (warn ? 'error' : 'notice') : 'cleared' });
   const b = $('banner');
   delete b.dataset.startup;
   b.textContent = msg;
@@ -1092,8 +1100,12 @@ function paintMessagePending() {
     if (!message.pendingId) return;
     const change = async (method, text) => {
       try {
+        const version = pendingVersions.get(id) || 0;
         const result = await api(`/api/sessions/${id}/pending`, {method, body:JSON.stringify({pendingId:message.pendingId,text})});
-        pendingMessages.set(id,result.pending); delete box.pendingRenderKey; paintMessagePending();
+        if ((pendingVersions.get(id) || 0) !== version) return;
+        pendingMessages.set(id,result.pending);
+        if (cur().session?.id !== id) return;
+        delete box.pendingRenderKey; paintMessagePending();
       } catch(e) { showBanner(e.message); }
     };
     $('pending-cancel'+suffix).onclick = () => change('DELETE');
@@ -1243,8 +1255,11 @@ function paintRestartNotice(result) {
   notice.hidden = pendingRestarts.size === 0;
 }
 
+let refreshGeneration = 0;
 async function refreshState() {
+  const generation = ++refreshGeneration;
   const s = await api('/api/state');
+  if (generation !== refreshGeneration) return s;
   // Assign field by field. A blanket Object.assign once let the server's
   // `running` (an array of busy session ids) land on top of the local boolean
   // of the same name - and [] is truthy, so send() silently refused forever.
@@ -1256,11 +1271,13 @@ async function refreshState() {
   state.apps = s.apps ?? [];
   state.models = s.models ?? {};
   state.default = s.default;
-  try {
-    const inventory = await api(state.session?.id ? `/api/sessions/${state.session.id}/models` : '/api/models/catalog');
+  const modelSession = state.session?.id;
+  api(modelSession ? `/api/sessions/${modelSession}/models` : '/api/models/catalog').then(inventory => {
+    if (generation !== refreshGeneration || state.session?.id !== modelSession) return;
     if (inventory.models) state.models = inventory.models;
     if (inventory.default) state.default = inventory.default;
-  } catch { /* the owner may be reconnecting */ }
+    paintHeader();
+  }).catch(() => {});
   refreshPushStatus();
   state.sessions = s.sessions ?? [];
   state.home = s.home ?? '';
@@ -1719,6 +1736,26 @@ function modelVersionDetails(m, events = []) {
   return parts.join(' · ');
 }
 
+function modelEffortLabel(session) {
+  const model = state.models[session.model];
+  if (!model) return `Model: ${session.model} · effort: unavailable`;
+  const cap = model.effortCapability;
+  const requested = session.effort || cap?.configured;
+  const effort = requested ? `${requested} requested${cap?.levels == null ? ' (unverified)' : cap.levels.includes(requested) ? '' : ' (unsupported)'}`
+    : cap?.levels?.length === 0 ? 'not supported' : `provider default${cap?.default ? ' (' + cap.default + ')' : ' (unknown)'}`;
+  return `Model: ${model.model || model.label || session.model} · effort: ${effort}`;
+}
+
+function effortControl(session) {
+  const cap = state.models[session.model]?.effortCapability;
+  const selected = session.effort || '';
+  if (cap?.levels == null) return `<input id="s-effort" value="${esc(selected)}" placeholder="Provider default" aria-label="Unverified effort override" />
+    <p class="dim">This source has not reported effort capabilities. Refresh its model list in AI sources. An explicit override is passed through unchanged, but its support and maximum are unknown.</p>`;
+  const values = ['', ...cap.levels, ...(selected && !cap.levels.includes(selected) ? [selected] : [])];
+  return `<select id="s-effort">${values.map(level => `<option value="${esc(level)}"${selected === level ? ' selected' : ''}>${esc(level ? level + (!cap.levels.includes(level) ? ' — unsupported; change this' : '') : 'Model default' + (cap.configured ? ' (' + cap.configured + ' configured)' : cap.default ? ' (' + cap.default + ')' : ''))}</option>`).join('')}</select>
+    <p class="dim">${cap.levels.length ? 'Supported by this model: ' + esc(cap.levels.join(', ')) : 'This model reports no effort control.'} Source: ${esc(cap.source)}. Values are sent unchanged; requested effort is not provider confirmation.</p>`;
+}
+
 async function sessionSettingsSheet() {
   try { await refreshState(); } catch (e) { if (executionNode) return machinesSheet(); throw e; }
   const session = cur().session;
@@ -1746,9 +1783,8 @@ async function sessionSettingsSheet() {
       ${state.models[session.model]?.provider === 'claude-cli' ? `<label>Claude permissions</label><select id="s-permission">${['default','acceptEdits','plan','bypassPermissions'].map(mode => `<option value="${mode}"${(session.claudePermission || state.models[session.model]?.permissionMode || 'default') === mode ? ' selected' : ''}>${{default:'Ask when needed',acceptEdits:'Accept edits; ask for other permissions',plan:'Plan only',bypassPermissions:'Full host access — no permission prompts'}[mode]}</option>`).join('')}</select><p class="dim">Claude asks through this chat. Full host access allows actions outside the project on the session’s computer.</p>` : ''}
       <p class="dim">${(() => { const model = state.models[session.model] || {}; return `Turn steps: no DO cutoff. Output limit: ${model.maxTokens || (model.provider === 'anthropic' ? '32,000 tokens per response' : 'provider default')}.${model.maxTurns ? ` Native turn limit configured: ${model.maxTurns}.` : ''}`; })()}</p>
       <label>Reasoning effort</label>
-      <select id="s-effort">${['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].map(level => `<option value="${level}"${(session.effort || '') === level ? ' selected' : ''}>${level || 'Model default'}</option>`).join('')}</select>
-      <p class="dim">Sent directly to the provider. Supported levels depend on the model; unsupported choices report an error instead of silently reducing effort. Default uses the model configuration.</p>
-      <div class="actions"><button class="ghost" id="s-effort-save">save effort</button></div>
+      ${effortControl(session)}
+      <div class="actions"><button class="ghost" id="s-effort-save">save effort</button>${['codex-cli','claude-cli'].includes(state.models[session.model]?.provider) ? '<button class="ghost" id="s-effort-refresh">refresh supported levels</button>' : ''}</div>
       <label>Mode</label>
       <div class="row">
         <button class="ghost${session.mode !== 'chat' ? ' on' : ''}" data-mode="agent">agent</button>
@@ -1794,11 +1830,22 @@ async function sessionSettingsSheet() {
   });
   $('session-git').onclick = gitSheet;
   $('s-close').onclick = closeSheet;
+  if ($('s-effort-refresh')) $('s-effort-refresh').onclick = async () => {
+    const button = $('s-effort-refresh'); button.disabled = true; button.textContent = 'Checking model capabilities…';
+    try {
+      const response = await nativeFetch('/api/cluster/sources', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({host:session.ownerNode,action:'discover',kind:state.models[session.model].provider})});
+      const result = await response.json();
+      if (!response.ok) throw Error(result.error || 'Model discovery failed.');
+      if (cur().session?.id === session.id && $('s-effort-refresh') === button) { await sessionSettingsSheet(); paintHeader(); }
+    } catch(e) { showBanner(e.message); button.disabled = false; button.textContent = 'refresh supported levels'; }
+  };
   if ($('s-effort-save')) $('s-effort-save').onclick = async () => {
     try {
       const updated = await api(`/api/sessions/${session.id}`, {method:'PATCH', body:JSON.stringify({effort:$('s-effort').value, ...($('s-permission') ? {claudePermission:$('s-permission').value} : {})})});
       if (cur().session?.id === session.id) { cur().session = updated; state.session = updated; }
       window.harnessTrace?.('visible', {screen:'session-settings', outcome:'effort-saved'});
+      paintHeader();
       showBanner('Effort saved for subsequent turns.');
     } catch (e) { showBanner(e.message); }
   };
@@ -1944,7 +1991,7 @@ function machineAddressLink(value) {
     const url = new URL(value);
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return '<div class="s">Address unavailable</div>';
     const address = esc(url.origin).replace(/"/g, '&quot;');
-    return `<a class="machine-address" href="${address}" target="_blank" rel="noopener noreferrer">${address}</a>`;
+    return `<a class="machine-address" href="${safeHref(url.origin)}" target="_blank" rel="noopener noreferrer">${address}</a>`;
   } catch { return '<div class="s">Address not configured</div>'; }
 }
 
@@ -2901,8 +2948,8 @@ function renderAppsSheet(d) {
     const offline = owner?.active === false;
     const label = offline ? 'owner offline' : a.runtimeKnown === false ? 'remote · status unknown' : !a.running ? 'stopped' : a.reachable ? 'running' : 'starting';
     const links = [];
-    if (a.urls?.phone) links.push(`<a href="${esc(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
-    if (a.urls?.desktop) links.push(`<a href="${esc(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
+    if (a.urls?.phone) links.push(`<a href="${safeHref(a.urls.phone)}" target="_blank" rel="noopener">phone: ${esc(a.urls.phone)}</a>`);
+    if (a.urls?.desktop) links.push(`<a href="${safeHref(a.urls.desktop)}" target="_blank" rel="noopener">laptop: ${esc(a.urls.desktop)}</a>`);
 
     if (a.urls?.phone || a.urls?.desktop) {
       const preview = `/app-preview.html?app=${encodeURIComponent(a.id)}${executionNode ? `&node=${encodeURIComponent(executionNode)}` : ''}`;
@@ -3105,7 +3152,7 @@ async function paintAppVisibility(app) {
     </div>
     <p class="dim">${isPublic
       ? 'Anyone can see this repository.'
-      : 'Only you can see this repository.'} <a href="${esc(v.url)}" target="_blank" rel="noopener">${esc(v.repo)}</a></p>`;
+      : 'Only you can see this repository.'} <a href="${safeHref(v.url)}" target="_blank" rel="noopener">${esc(v.repo)}</a></p>`;
 
   box.querySelectorAll('[data-setvis]').forEach((el) => {
     el.onclick = async () => {
@@ -3540,7 +3587,7 @@ function paintPending() {
   box.hidden = pendingShots.length === 0;
   box.innerHTML = pendingShots.map((a, i) => `
     <div class="thumb${a.uploading ? ' busy' : ''}">
-      ${a.preview ? `<img src="${a.preview}" alt="">` : ''}
+      ${a.preview ? `<img src="${esc(a.preview)}" alt="">` : ''}
       <button class="drop" data-drop-shot="${i}" aria-label="Remove">×</button>
     </div>`).join('');
   box.querySelectorAll('[data-drop-shot]').forEach((el) => {
@@ -3827,8 +3874,8 @@ setInterval(async () => {
     const catalog = await response.json();
     if (state.session?.id !== session.id || state.session?.model !== session.model) return;
     const status = catalog.models[session.model]?.runtimeStatus || 'unknown';
-    $('title-sub').textContent = `Model: ${state.models[session.model]?.label || session.model} ? ${status === 'not loaded' ? 'not loaded ? loads on send' : status === 'loaded' ? 'loaded' : status}`;
+    $('title-sub').textContent = `${modelEffortLabel(session)} · ${status === 'not loaded' ? 'not loaded ? loads on send' : status === 'loaded' ? 'loaded' : status}`;
   } catch {
-    if (state.session?.id === session.id) $('title-sub').textContent = 'Local model status unavailable';
+    if (state.session?.id === session.id) $('title-sub').textContent = modelEffortLabel(session) + ' · local status unavailable';
   } finally { sessionRuntimePending = false; }
 }, 2000);

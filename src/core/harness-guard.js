@@ -10,10 +10,12 @@
  * a harness that breaks itself cannot be recovered without walking to the
  * laptop, which is the situation it exists to avoid.
  *
- * Reading is allowed. A session may look at the harness to understand it; it
- * simply may not change it.
+ * Harness source is readable. Private Harness data is denied by the file-tool
+ * policy on reads and writes. Shell and native providers have separate OS and
+ * provider policies; this module does not establish a universal sandbox.
  */
 
+import { canonicalPath } from './path-policy.js';
 import { defaultDataDir } from './platform.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -47,7 +49,7 @@ export function protectedFromHarnessEditor() {
 }
 
 function isInside(root, target) {
-  const rel = path.relative(root, target);
+  const rel = path.relative(canonicalPath(root), canonicalPath(target));
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 

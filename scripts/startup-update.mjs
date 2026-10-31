@@ -22,7 +22,16 @@ export async function startupUpdate(root) {
     const remote = await git('config', `branch.${branch}.remote`);
     const ref = await git('config', `branch.${branch}.merge`);
     if (!remote || remote === '.' || !ref.startsWith('refs/heads/')) throw Error('Configure a remote tracking branch before starting.');
-    await git('fetch', '--no-tags', remote, ref);
+    try { await git('fetch', '--no-tags', remote, ref); }
+    catch (error) {
+      // Only a previously published, clean local revision is an offline fallback.
+      // Missing tracking evidence, local divergence and dependency errors remain fatal.
+      const head = await git('rev-parse', 'HEAD');
+      const known = await git('rev-parse', '@{upstream}');
+      if (head !== known) throw error;
+      console.warn('Remote update unavailable; starting the clean, previously tracked local revision.');
+      return head;
+    }
     const latest = await git('rev-parse', 'FETCH_HEAD');
     await git('merge', '--ff-only', latest);
     const head = await git('rev-parse', 'HEAD');

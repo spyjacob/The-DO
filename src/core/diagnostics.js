@@ -21,6 +21,7 @@ export function diagnostics(dir, host, revision) {
     try { const s = await fs.statfs(root); return { freeBytes: s.bavail * s.bsize, totalBytes: s.blocks * s.bsize }; }
     catch { return { freeBytes: null, totalBytes: null }; }
   }
+  let cachedSpace = null, checkedAt = 0, segment = null;
   async function maintain() {
     const space = await disk(), list = await files();
     let bytes = list.reduce((n, f) => n + f.bytes, 0);
@@ -28,7 +29,11 @@ export function diagnostics(dir, host, revision) {
     for (const f of list) if (bytes > limit || f.at < Date.now() - config.days * 86400000 || (space.freeBytes !== null && space.freeBytes < 2 * 1073741824)) {
       await fs.unlink(path.join(root, f.name)); bytes -= f.bytes;
     }
-    return { ...space, bytes, effectiveMaxBytes: limit };
+    cachedSpace = { ...space, bytes, effectiveMaxBytes: limit };
+    checkedAt = Date.now();
+    const retained = await files();
+    segment = retained.at(-1) || null;
+    return cachedSpace;
   }
   const safe = (v) => typeof v === 'string' && /^[a-zA-Z0-9_.:-]{1,100}$/.test(v) ? v : undefined;
   function record(event, details = {}) {
@@ -41,13 +46,16 @@ export function diagnostics(dir, host, revision) {
         if (safe(details[key])) row[key] = details[key];
       for (const key of ['durationMs','status','width','height','count','conflicts','term','clientAt'])
         if (Number.isFinite(details[key])) row[key] = Math.max(0, Math.min(details[key], 1e15));
-      const space = await maintain();
+      const space = !cachedSpace || Date.now() - checkedAt >= 1000 ? await maintain() : cachedSpace;
       if (space.effectiveMaxBytes < 4096 || (space.freeBytes !== null && space.freeBytes < 2 * 1073741824)) { dropped++; return; }
-      const list = await files(), last = list.at(-1);
-      const name = last && last.bytes < 4 * 1048576 && last.at > Date.now() - 86400000 ? last.name : Date.now() + '-' + crypto.randomUUID() + '.jsonl';
-      await fs.appendFile(path.join(root, name), JSON.stringify(row) + '\n', { mode: 0o600 });
-      await maintain();
-    }).catch(() => { failed++; }).finally(() => pending--);
+      if (!segment || segment.bytes >= 4 * 1048576 || segment.at <= Date.now() - 86400000)
+        segment = {name:Date.now() + '-' + crypto.randomUUID() + '.jsonl', bytes:0, at:Date.now()};
+      const line = JSON.stringify(row) + '\n';
+      await fs.appendFile(path.join(root, segment.name), line, { mode: 0o600 });
+      const bytes = Buffer.byteLength(line); segment.bytes += bytes; cachedSpace.bytes += bytes;
+      if (cachedSpace.freeBytes !== null) cachedSpace.freeBytes -= bytes;
+      if (cachedSpace.bytes >= cachedSpace.effectiveMaxBytes) await maintain();
+    }).catch(() => { failed++; cachedSpace = null; segment = null; }).finally(() => pending--);
   }
   return {
     record,

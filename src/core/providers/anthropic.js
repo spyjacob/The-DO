@@ -18,13 +18,13 @@ export function makeClient(spec) {
  * One completion. Returns the neutral reply shape the agent loop expects:
  * { text, thinking, toolCalls, usage, stopReason, error }.
  */
-export async function complete({ client, spec, events, system, onText, onThinking, signal }) {
+export async function complete({ client, spec, events, system, onText, onThinking, signal, useTools = true }) {
   const messages = toAnthropic(events);
   const params = {
     model: spec.model,
     max_tokens: spec.maxTokens ?? 32000,
     messages,
-    tools: toAnthropicTools(),
+    ...(useTools ? { tools: toAnthropicTools() } : {}),
     ...(system ? { system } : {}),
     thinking: { type: 'adaptive', display: 'summarized' },
     ...(spec.effort ? { output_config: { effort: spec.effort } } : {}),

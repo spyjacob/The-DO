@@ -1,3 +1,4 @@
+import { validateEffort } from '../src/core/model-effort.js';
 /**
  * LAN server: the same harness core, driven from a phone.
  *
@@ -44,7 +45,7 @@ import { loadSecrets, setSecret } from '../src/core/secrets.js';
 import { transcribe, transcriptionKey } from '../src/core/transcription.js';
 import * as attachments from '../src/core/attachments.js';
 import * as git from '../src/core/git.js';
-import { mergeTab, prepareTab, integrateTab, tabHasUnpublishedWork, pendingSummary, syncHarnessCheckout } from '../src/core/tab-workspaces.js';
+import { readPublication, mergeTab, prepareTab, integrateTab, tabHasUnpublishedWork, pendingSummary, syncHarnessCheckout } from '../src/core/tab-workspaces.js';
 import { configureGithub, createGithubAuth } from '../src/core/github-auth.js';
 import { loadNotify, saveNotify, send as sendNotify, summarise, notificationSetupError } from '../src/core/notify.js';
 import * as store from '../src/core/store.js';
@@ -52,6 +53,7 @@ import { noteEvent, userEvent, assistantEvent, tally } from '../src/core/transcr
 import { eraseEvent, rewindTo } from '../src/core/rewind.js';
 import { normalizeProviderLimits, WINDOWS } from '../src/core/usage.js';
 import * as codexCli from '../src/core/providers/codex-cli.js';
+import { canonicalPath, insidePath } from '../src/core/path-policy.js';
 import { refuseAsProjectDir } from '../src/core/harness-guard.js';
 import { loadEmailConfig, saveEmailConfig } from '../src/core/email-config.js';
 import * as apps from '../src/core/apps.js';
@@ -321,7 +323,7 @@ function authorized(req, url) {
   if (['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(peer) &&
       req.headers['tailscale-user-login'] && !req.headers['tailscale-funnel-request']) return true;
   if (cluster?.trusted(req)) return true;
-  if (!TOKEN) return true; // open by default
+  if (!TOKEN) return ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(peer) && ['localhost','127.0.0.1','[::1]'].includes(url.hostname); // refuse LAN callers and DNS rebinding
   const supplied =
     url.searchParams.get('t') ||
     req.headers['x-harness-token'] ||
@@ -571,7 +573,6 @@ async function dispatchMessage(id, body, reply) {
   }
   const placementInfo = await sessionPlacement(session);
   if (session.appId && !placementInfo.hosts.includes(cluster.self.id)) return reply(409, { error: 'This computer is not enabled for this project.' });
-  live.set(id, session);
   const cfg = await loadConfig(USER_DATA);
   if (cfg.error) return reply(400, { error: cfg.error });
 
@@ -584,6 +585,7 @@ async function dispatchMessage(id, body, reply) {
   const sentAt = session.events.length;
   const controller = new AbortController();
   const turn = { controller, startedAt: Date.now(), last: null, executionEpoch: session.executionEpoch || 0 };
+  live.set(id, session);
   running.set(id, turn);
   // Replicated with the session, so if this host disappears mid-turn the
   // next main can fail this one tab instead of leaving it looking busy.
@@ -765,6 +767,14 @@ async function joinHost(body) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const { pathname } = url;
+  // Browsers must not use a malicious page to drive the owner's local API.
+  // Cluster and CLI clients have no Origin; signed peers may proxy an original one.
+  if (!cluster?.trusted(req) && pathname.startsWith('/api/') && req.method !== 'GET' && req.method !== 'HEAD') {
+    let originHost;
+    try { if (req.headers.origin) originHost = new URL(req.headers.origin).host; } catch { originHost = 'invalid'; }
+    if ((originHost && originHost !== req.headers.host) || req.headers['sec-fetch-site'] === 'cross-site')
+      return json(res,403,{error:'Cross-origin mutation refused.'});
+  }
   res.gzipOk = /\bgzip\b/.test(req.headers['accept-encoding'] ?? '');
 
   // Only minimal health is public, so an already-authorized browser can find
@@ -795,7 +805,8 @@ const server = http.createServer(async (req, res) => {
   const requestId = /^[a-zA-Z0-9-]{1,100}$/.test(req.headers['x-harness-trace'] || '')
     ? req.headers['x-harness-trace'] : crypto.randomUUID();
   if (pathname.startsWith('/api/') && !pathname.startsWith('/api/diagnostics')) {
-    const route = pathname.split('/').slice(1, 3).join('.');
+    const operation = pathname.match(/^\/api\/(?:sessions|apps)\/[^/]+\/([a-z-]+)$/)?.[1];
+    const route = pathname.split('/').slice(1, 3).join('.') + (operation ? '.' + operation : '');
     res.once('finish', () => {
       const durationMs = Date.now() - requestStarted;
       // Routine replication heartbeats otherwise bury the user's interactions.
@@ -842,7 +853,7 @@ const server = http.createServer(async (req, res) => {
 
   // First hit carries ?t=; stow it in a cookie so later navigations are clean.
   if (url.searchParams.has('t')) {
-    res.setHeader('Set-Cookie', `ht=${cluster?.verifyTicket(url.searchParams.get('t')) ? url.searchParams.get('t') : TOKEN}; Path=/; Max-Age=31536000; SameSite=Lax`);
+    res.setHeader('Set-Cookie', `ht=${cluster?.verifyTicket(url.searchParams.get('t')) ? url.searchParams.get('t') : TOKEN}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax${req.headers['tailscale-user-login'] ? '; Secure' : ''}`);
   }
 
   try {
@@ -1201,6 +1212,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (dir !== path.resolve(asked)) note = `${asked} no longer exists — showing ${dir}`;
 
+      if (insidePath(canonicalPath(USER_DATA), canonicalPath(dir))) return json(res,403,{error:'Harness private data cannot be browsed.'});
       const entries = await fs.readdir(dir, { withFileTypes: true });
       return json(res, 200, {
         path: dir,
@@ -1318,7 +1330,9 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'PATCH' && appId) {
         try {
           const patch = await readBody(req);
-          delete patch.ownerNode;
+          const fields = new Set(['name','dir','repo','start','hosts','port','servePort','aiDependencies']);
+          if (!patch || Array.isArray(patch) || Object.keys(patch).some(key => !fields.has(key))) throw new Error('Unsupported project setting.');
+          for (const key of ['name','dir','start']) if (patch[key] !== undefined && typeof patch[key] !== 'string') throw new Error(`Invalid ${key}.`);
           if (patch.hosts !== undefined) {
             if (!cluster.shared()) throw new Error('Join another machine before choosing where this project lives.');
             const app = (await apps.load(USER_DATA)).find((a) => a.id === appId);
@@ -1559,6 +1573,7 @@ const server = http.createServer(async (req, res) => {
         createRepository: Boolean(app && !app.builtin), repositoryName: git.defaultRepoName(session.projectDir, app?.name),
         isolated: Boolean(session.tabWorkspace), enabled: false,
         summary: url.searchParams.get('history') === '1' ? await pendingSummary(session) : undefined,
+        publication: await readPublication(session),
         pending: await tabHasUnpublishedWork(session), machine: cluster.self.name || cluster.self.id,
         busy: running.has(id), history: history.sort((a, b) => b.ts - a.ts).slice(0, 12) });
     }
@@ -1588,6 +1603,7 @@ const server = http.createServer(async (req, res) => {
       if (!session.tabWorkspace) return json(res, 409, { error: 'Start an isolated coding turn before integrating changes.' });
       const last = [...session.events].reverse().find((e) => e.type === 'assistant');
       const startedAt = Date.now();
+      let publicationResult = null;
       running.set(id, { controller: new AbortController(), startedAt, last: 'integration', executionEpoch: session.executionEpoch || 0 });
       live.set(id, session);
       try {
@@ -1618,6 +1634,7 @@ const server = http.createServer(async (req, res) => {
             await runTurn({ session, models: cfg.models,
               userText: `${reason === 'checks-failed' ? `Repair the failing integration checks; read ${log}.` : 'Resolve the merge conflict.'} Integrate commit ${target} in this isolated tab worktree. Conflicted files: ${conflicts}.
 Preserve both branches' intended behavior. Merge and commit the resolution on the current tab branch. Do not push, switch branches, modify other worktrees, weaken tests, or alter integration checks. Run the existing checks. If intent is ambiguous or repair cannot be verified, leave work saved and explain the blocker.`,
+              requestInteraction: (request, signal) => requestInteraction(id, request, signal),
               attachments: [], signal: AbortSignal.any([running.get(id).controller.signal, AbortSignal.timeout(300000)]),
               monitorsFile: monitorsPath(USER_DATA), activityCmd: '',
               save: s => store.save(s), onEvent: event => broadcast(id, {kind:'event', event}),
@@ -1644,6 +1661,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
           push: true,
           model: session.model, servedModel: last?.servedModel,
         });
+        if (result.pushed) publicationResult = result.publication || {state:'published', candidate:result.sha};
         if (!result.ok || (!mergeOnly && !result.pushed && result.skipped !== 'no changes'))
           throw new Error(result.error || result.reason || 'Publication did not finish.');
         if (app && !app.builtin && result.created) {
@@ -1656,20 +1674,23 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         });
         await announce(note);
         await announce({ ...assistantEvent({ text: mergeOnly ? `Merge done · ${result.sha}. Checks passed. Nothing published.` : result.pushed
-          ? `Push done · ${result.files?.length || 0} files · ${result.sha}.${app?.builtin ? ' Restart Harness to load the changes.' : ''}`
+          ? `Push done · ${result.files?.length || 0} files · ${result.sha}.${result.warning ? ' ' + result.warning : ''}${app?.builtin ? ' Restart Harness to load the changes.' : ''}`
           : 'Already up to date. Nothing new to push.' }), operation: 'push', outcome: 'success' });
         usageHistory?.record(mergeOnly ? 'merge.finished' : 'push.finished', { correlationId: requestId, outcome: mergeOnly ? 'merged' : 'published', durationMs: Date.now() - startedAt });
         return json(res, 200, result);
       } catch (e) {
-        const note = noteEvent(`Not published: ${e.message}`, { publication: 'failed',
-          pushReceipt: { machine: cluster.self.name || cluster.self.id, status: 'Failed', error: e.message } });
-        const reply = { ...assistantEvent({ text: `${mergeOnly ? 'Merge' : 'Push'} did not complete: ${e.message}` }), operation: 'push' };
+        const publication = publicationResult || e.publication;
+        const description = publication?.state === 'published' ? `Published ${publication.candidate}; follow-up failed`
+          : publication ? 'Remote publication outcome is uncertain; inspect the saved publication receipt and remote branch before retrying' : 'Not published';
+        const note = noteEvent(`${description}: ${e.message}`, { publication: publication ? publication.state : 'failed',
+          pushReceipt: { machine: cluster.self.name || cluster.self.id, status: publication?.state === 'published' ? 'Published; follow-up failed' : publication ? 'Outcome uncertain' : 'Failed', error: e.message } });
+        const reply = { ...assistantEvent({ text: `${description}. ${mergeOnly ? 'Merge' : 'Push'} did not complete: ${e.message}` }), operation: 'push' };
         session.events.push(note, reply);
-        await store.save(session);
+        await store.save(session).catch(() => {});
         broadcast(id, { kind: 'event', event: note });
         broadcast(id, { kind: 'event', event: reply });
         usageHistory?.record(mergeOnly ? 'merge.finished' : 'push.finished', { correlationId: requestId, outcome: 'failed', durationMs: Date.now() - startedAt });
-        return json(res, 409, { error: e.message });
+        return json(res, 409, { error: `${description}: ${e.message}`, publication });
       } finally {
         if (session.turnHost) {
           delete session.turnHost;
@@ -1825,6 +1846,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
       }
       if (dir !== path.resolve(asked)) note = `${asked} no longer exists — showing ${dir}`;
 
+      if (insidePath(canonicalPath(USER_DATA), canonicalPath(dir))) return json(res,403,{error:'Harness private data cannot be browsed.'});
       const entries = await fs.readdir(dir, { withFileTypes: true });
       const dirs = [];
       const files = [];
@@ -1850,7 +1872,20 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
     // ---- one file's contents, for the phone to render
     if (req.method === 'GET' && pathname === '/api/file') {
       let file = path.resolve(url.searchParams.get('path') ?? '');
-      if (cluster.shared()) file = await clusterAssets.resolve(file);
+      const scopedId = url.searchParams.get('session') || req.headers['x-harness-session'];
+      const session = scopedId ? await store.load(scopedId, {repair:false}) : null;
+      const attachment = session?.events?.flatMap(event => event.attachments || []).find(item => item.path === file);
+      if (attachment && cluster.shared()) file = await clusterAssets.resolve(file);
+      const target = canonicalPath(file);
+      const approvedAttachment = Boolean(attachment && insidePath(canonicalPath(path.join(USER_DATA,'attachments')), target));
+      const roots = session
+        ? [session.projectDir, session.tabWorkspace?.cwd, session.tabWorkspace?.dir, ...(session.readableDirs || [])].filter(Boolean)
+        : (await apps.load(USER_DATA)).map(app => app.dir);
+      if (!approvedAttachment && (insidePath(canonicalPath(USER_DATA), target) ||
+          !(session?.confineToProjectDir === false || roots.some(root => insidePath(canonicalPath(root), target)))))
+        return json(res, 403, {error:'File is outside the project and its approved readable folders.'});
+      file = target;
+
       const st = await fs.stat(file).catch(() => null);
       if (!st?.isFile()) return json(res, 404, { error: 'not a file' });
 
@@ -1885,9 +1920,12 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
           ? 'application/octet-stream'
           : MIME_FILE[path.extname(file).toLowerCase()] ?? 'application/octet-stream',
         'Content-Length': body.length,
+        'X-Content-Type-Options': 'nosniff',
+        // Even an HTML/SVG file opened directly gets an opaque origin and no scripts.
+        'Content-Security-Policy': "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'",
         'Cache-Control': 'no-store',
         ...(download
-          ? { 'Content-Disposition': `attachment; filename="${path.basename(file).replace(/"/g, '')}"` }
+          ? { 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(file))}` }
           : {}),
       });
       return res.end(body);
@@ -1897,7 +1935,8 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
     if (req.method === 'POST' && pathname === '/api/dirs') {
       const { parent, name } = await readBody(req);
       if (!name || /[/\\]/.test(name)) return json(res, 400, { error: 'invalid folder name' });
-      const made = path.join(parent, name);
+      const made = canonicalPath(path.join(parent, name));
+      if (insidePath(canonicalPath(USER_DATA), made)) return json(res,403,{error:'Harness private data is protected.'});
       await fs.mkdir(made, { recursive: true });
       return json(res, 200, { path: made });
     }
@@ -1992,19 +2031,27 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
       if (req.method === 'PATCH' && id && !verb) {
         const session = live.get(id) ?? (await store.load(id, { repair: !running.has(id) }));
         const patch = await readBody(req);
+        if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return json(res,400,{error:'Session settings must be an object.'});
         if (running.has(id)) return json(res, 409, { error: 'Wait for the current turn and integration to finish before editing this session.' });
         if (patch.claudePermission !== undefined && !['default','acceptEdits','plan','bypassPermissions'].includes(patch.claudePermission))
           return json(res, 400, {error:'Invalid Claude permission mode.'});
-        if (patch.effort !== undefined && !['', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(patch.effort))
+        if (patch.effort !== undefined && (typeof patch.effort !== 'string' || (patch.effort !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(patch.effort))))
           return json(res, 400, { error: 'Invalid effort level.' });
-        delete patch.nativeClaude;
-        delete patch.queueTurn;
-        delete patch.ownerNode;
-        delete patch.executionEpoch;
-        delete patch.turnHost;
-        delete patch.turnStartedAt;
-        delete patch.tabWorkspace;
-        delete patch.integrationLog;
+        const effortModel = (await loadConfig(USER_DATA)).models[patch.model || session.model];
+        try {
+          if (patch.effort || (patch.model && patch.model !== session.model && session.effort))
+            validateEffort(effortModel || {}, patch.effort === undefined ? session.effort : patch.effort);
+        } catch (error) { return json(res,400,{error:error.message + ' Choose a supported effort or clear the override before switching models.'}); }
+        const fields = new Set(['name','model','system','projectDir','mode','confineToProjectDir','readableDirs','allowLongContext','effort','claudePermission']);
+        if (!patch || Array.isArray(patch) || Object.keys(patch).some(key => !fields.has(key)))
+          return json(res, 400, {error:'Unsupported session setting.'});
+        for (const key of ['name','model','system','projectDir','mode','effort','claudePermission'])
+          if (patch[key] !== undefined && typeof patch[key] !== 'string') return json(res,400,{error:`Invalid ${key}.`});
+        for (const key of ['confineToProjectDir','allowLongContext'])
+          if (patch[key] !== undefined && typeof patch[key] !== 'boolean') return json(res,400,{error:`Invalid ${key}.`});
+        if (patch.mode !== undefined && !['agent','chat'].includes(patch.mode)) return json(res,400,{error:'Invalid session mode.'});
+        if (patch.readableDirs !== undefined && (!Array.isArray(patch.readableDirs) || patch.readableDirs.some(p => typeof p !== 'string' || !path.isAbsolute(p))))
+          return json(res,400,{error:'Readable folders must be absolute paths.'});
         if (patch.projectDir && patch.projectDir !== session.projectDir) delete session.tabWorkspace;
         const badDir = refuseAsProjectDir(patch.projectDir);
         if (badDir) return json(res, 400, { error: badDir });

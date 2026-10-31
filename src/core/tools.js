@@ -9,7 +9,8 @@
  * anything the user can do.
  */
 
-import { exec } from 'node:child_process';
+import { canonicalPath, insidePath } from './path-policy.js';
+import { exec, spawn, execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -68,13 +69,14 @@ function truncate(text) {
  * @param write  true for tools that modify. Read-only grants do not cover these.
  */
 function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false, allowHarnessSource = false) {
-  const target = path.resolve(projectDir, p ?? '.');
+  const target = canonicalPath(path.resolve(projectDir, p ?? '.'));
+  if (insidePath(canonicalPath(HARNESS_DATA), target)) throw new Error('refused: Harness private data is not accessible through file tools.');
 
   // Absolute, and checked before `allowOutside`: no session setting may grant
   // write access to the harness itself. Reading it stays allowed. The Harness
   // app's own sessions are the deliberate exception — they may write the
   // harness source, but never its data directory.
-  if (write && isProtected(target, { allowHarnessSource })) {
+  if (write && (isProtected(target, { allowHarnessSource }) || (!allowHarnessSource && insidePath(canonicalPath(HARNESS_ROOT), target)))) {
     throw new Error(
       allowHarnessSource
         ? `refused: ${p} is inside the harness data directory, which stays protected even for the Harness app.`
@@ -86,7 +88,7 @@ function resolveIn(projectDir, p, allowOutside, readableDirs = [], write = false
   if (allowOutside) return target;
 
   const within = (root) => {
-    const rel = path.relative(root, target);
+    const rel = path.relative(canonicalPath(root), target);
     return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
   };
 
@@ -117,6 +119,34 @@ function guarded(command, { allowHarnessSource = false } = {}) {
 }
 
 const shellQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+async function runShell(command, ctx, PATH) {
+  ctx.signal?.throwIfAborted();
+  return new Promise((resolve,reject) => {
+    const child = spawn(command, {shell:true, cwd:ctx.projectDir, env:{...process.env,PATH},
+      detached:process.platform !== 'win32', windowsHide:true, stdio:['ignore','pipe','pipe']});
+    let stdout='', stderr='', stopped=false, killTimer;
+    const kill = signal => {
+      if (!child.pid) return;
+      if (process.platform === 'win32') execFile('taskkill.exe',['/PID',String(child.pid),'/T','/F'],()=>{});
+      else { try { process.kill(-child.pid,signal); } catch {} }
+    };
+    const stop = () => { if (stopped) return; stopped=true; kill('SIGTERM'); killTimer ||= setTimeout(()=>kill('SIGKILL'),1000); };
+    const timer=setTimeout(stop,BASH_TIMEOUT_MS);
+    ctx.signal?.addEventListener('abort',stop,{once:true});
+    child.stdout.on('data',chunk=>{ stdout=(stdout+chunk).slice(0,8*1024*1024); if(stdout.length+stderr.length>=8*1024*1024) stop(); });
+    child.stderr.on('data',chunk=>{ stderr=(stderr+chunk).slice(0,8*1024*1024); if(stdout.length+stderr.length>=8*1024*1024) stop(); });
+    const cleanup=()=>{clearTimeout(timer); clearTimeout(killTimer);ctx.signal?.removeEventListener('abort',stop);};
+    child.once('error',error=>{cleanup();reject(error);});
+    child.once('close',code=>{
+      if(stopped) kill('SIGKILL');
+      cleanup();
+      if(code===0 && !stopped) resolve({stdout,stderr});
+      else reject(Object.assign(Error(stopped?'Command cancelled or resource limit reached; external effects may already have occurred.':`exit code ${code}`),{code,stdout,stderr,cancelled:stopped}));
+    });
+    if(ctx.signal?.aborted) stop();
+  });
+}
 
 // ------------------------------------------------------------- definitions
 
@@ -232,18 +262,14 @@ export const TOOLS = [
     async run({ command }, ctx) {
       const PATH = await loginPath();
       try {
-        const { stdout, stderr } = await execAsync(guarded(command, { allowHarnessSource: ctx.allowHarnessSource }), {
-          cwd: ctx.projectDir,
-          timeout: BASH_TIMEOUT_MS,
-          maxBuffer: 8 * 1024 * 1024,
-          env: { ...process.env, PATH },
-        });
+        const { stdout, stderr } = await runShell(guarded(command, { allowHarnessSource: ctx.allowHarnessSource }), ctx, PATH);
         const out = [stdout, stderr].filter(Boolean).join('\n').trim();
         return out || '(no output)';
       } catch (e) {
         // A non-zero exit is information for the model, not a crash. Hand back
         // the output and the code and let it decide what to do.
         const parts = [e.stdout, e.stderr].filter(Boolean).join('\n').trim();
+        if (e.cancelled) throw new Error(e.message + '\n' + parts);
         if (e.killed) throw new Error(`command timed out after ${BASH_TIMEOUT_MS / 1000}s\n${parts}`);
         throw new Error(`exit code ${e.code ?? '?'}\n${parts}`);
       }
@@ -300,6 +326,7 @@ export async function runTool(call, ctx) {
   const tool = BY_NAME[call.name];
   if (!tool) return { ok: false, output: `unknown tool: ${call.name}` };
   try {
+    ctx.signal?.throwIfAborted();
     const output = await tool.run(call.args ?? {}, ctx);
     return { ok: true, output: truncate(output) };
   } catch (e) {

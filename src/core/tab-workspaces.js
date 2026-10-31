@@ -1,3 +1,4 @@
+import { atomicFile } from './atomic-file.js';
 /** Per-tab working trees and serialized, tested integration into the project. */
 import { documentAI } from './app-ai.js';
 import fs from 'node:fs/promises';
@@ -256,6 +257,12 @@ async function mergeForIntegration(ws, target, options) {
     if (await git(ws.dir, 'symbolic-ref', '--short', 'HEAD') !== ws.branch || !await clean(ws.dir))
       throw Error('Merge repair left uncommitted work. Work is preserved; publication stopped.');
     await git(ws.dir, 'merge-base', '--is-ancestor', target, 'HEAD');
+    // A conflict in the validation itself needs human review. Comparing both
+    // parents prevents automatic repair from inventing weakened checks.
+    for (const base of [before, target]) {
+      const altered = await git(ws.dir, 'diff', '--name-only', base, 'HEAD', '--', 'package.json', 'package-lock.json', '.harness-integration.json', 'test', 'tests');
+      if (altered) throw Error('Automatic merge repair affected check definitions. Work is saved; explicit review is required before publishing.');
+    }
   }
 }
 
@@ -283,6 +290,16 @@ export async function mergeTab(session, options = {}) {
     if (!await clean(ws.dir) || await git(ws.dir, 'rev-parse', 'HEAD') !== candidate) throw Error('Tab changed during checks. Retry merge.');
     return { ok: true, merged: true, pushed: false, sha: candidate.slice(0, 8) };
   });
+}
+
+export async function readPublication(session) {
+  const ws = session.tabWorkspace;
+  if (!ws) return null;
+  const directory = path.join(ws.common, 'harness-publications', path.basename(ws.dir));
+  let names;
+  try { names = (await fs.readdir(directory)).filter(n => n.endsWith('.json')).sort(); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+  return names.length ? JSON.parse(await fs.readFile(path.join(directory,names.at(-1)), 'utf8')) : null;
 }
 
 async function integrateDistributed(repo, session, options) {
@@ -316,20 +333,33 @@ async function integrateDistributed(repo, session, options) {
     if (await git(ws.dir, 'rev-parse', 'HEAD') !== candidate || !await clean(ws.dir)
       || await git(repo.root, 'rev-parse', 'HEAD') !== local || !await clean(repo.root))
       throw new Error('Files changed during integration checks; retry integration.');
+    const files = (await git(ws.dir, 'diff', '--name-only', local, candidate)).split('\n').filter(Boolean);
     await options.beforePublish?.();
+    const receipt = {version:1, candidate, target:ws.target, at:new Date().toISOString(), state:'remote-outcome-unknown'};
+    const receiptFile = path.join(repo.common, 'harness-publications', path.basename(ws.dir), Date.now() + '-' + crypto.randomUUID() + '.json');
+    await atomicFile(receiptFile, JSON.stringify(receipt));
     try { await git(ws.dir, 'push', 'origin', `${candidate}:refs/heads/${ws.target}`); }
     catch (e) {
       // Retry only a changed remote tip, never an uncertain unchanged failure.
-      const latest = await fetchTarget(repo, ws.target);
-      if (latest === candidate) { /* the push succeeded but its reply was lost */ }
+      let latest;
+      try { latest = await fetchTarget(repo, ws.target); }
+      catch (error) { error.publication = receipt; throw error; }
+      const included = latest && await git(ws.dir,'merge-base','--is-ancestor',candidate,latest).then(()=>true,()=>false);
+      if (included) { /* Published, even if another publisher advanced again. */ }
       else if (latest !== remote) {
         await options.onWaiting?.('Another computer published first; merging and checking its changes.');
         continue;
-      } else throw e;
+      } else { e.publication = receipt; throw e; }
     }
-    await git(repo.root, 'merge', '--ff-only', candidate);
-    const files = (await git(ws.dir, 'diff', '--name-only', local, candidate)).split('\n').filter(Boolean);
-    return { ok: true, integrated: true, pushed: true, committed: true, sha: candidate.slice(0, 8), commitUrl: await commitLink(repo, candidate, true), files };
+    receipt.state = 'published';
+    let warning = null;
+    try { await atomicFile(receiptFile, JSON.stringify(receipt)); }
+    catch (error) { warning = 'Published, but receipt persistence failed: ' + error.message; }
+    try { await git(repo.root, 'merge', '--ff-only', candidate); receipt.localCheckout = 'updated'; }
+    catch (error) { receipt.localCheckout = 'pending'; warning = 'Published; local checkout update failed: ' + (error.stderr || error.message); }
+    try { await atomicFile(receiptFile, JSON.stringify(receipt)); }
+    catch (error) { warning ||= 'Published, but receipt persistence failed: ' + error.message; }
+    return { ok: true, integrated: receipt.localCheckout === 'updated', pushed: true, committed: true, sha: candidate.slice(0, 8), publication:receipt, warning, commitUrl: await commitLink(repo, candidate, true).catch(()=>null), files };
   }
   throw new Error('Other computers are still publishing changes. Tab work is saved; retry integration when they finish.');
 }

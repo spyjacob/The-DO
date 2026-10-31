@@ -1,3 +1,4 @@
+import { atomicFile } from './atomic-file.js';
 /**
  * Session persistence. A session is one project run: a name, a directory, a
  * model, and the neutral event transcript.
@@ -6,8 +7,9 @@
  * two sessions - or fork one, which copies the history so the second model
  * starts from identical context.
  *
- * Files are written atomically after every event, so a crash costs at most the
- * turn in flight.
+ * Files are replaced atomically after saved events. Accepted text is distinct
+ * from an executable job: pending queues are still process-local, and external
+ * side effects are not replayed after a crash.
  */
 
 import fs from 'node:fs/promises';
@@ -73,7 +75,6 @@ export function newSession({ name, model, projectDir, system = '', mode = 'agent
 // than a write completes, and two saves racing on a shared temp filename meant
 // the second rename found nothing there — which crashed the server mid-turn.
 const writing = new Map();
-let writeSeq = 0;
 
 export async function save(session) {
   if (shared()) {
@@ -90,15 +91,7 @@ export async function save(session) {
     .then(async () => {
       session.updatedAt = Date.now();
       const file = fileFor(session.id);
-      // Unique per write, so concurrent saves cannot collide on the same path.
-      const tmp = `${file}.${process.pid}.${(writeSeq += 1)}.tmp`;
-      try {
-        await fs.writeFile(tmp, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
-        await fs.rename(tmp, file);        // atomic: never a half-written transcript
-      } catch (e) {
-        await fs.rm(tmp, { force: true }).catch(() => {});
-        throw e;
-      }
+      await atomicFile(file, `${JSON.stringify(session, null, 2)}\n`);
       return session;
     });
 

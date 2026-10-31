@@ -1,5 +1,6 @@
 // Wait for the old listener to close without requiring lsof or a Unix shell.
 import net from 'node:net';
+import { verifyDependencies } from './dependency-state.mjs';
 import path from 'node:path';
 import { startupUpdate } from './startup-update.mjs';
 import { spawn } from 'node:child_process';
@@ -8,6 +9,7 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invali
 // Keep the old process serving until its checkout passes the pull check.
 try {
   const revision = await startupUpdate(path.resolve(path.dirname(process.argv[3]), '..'));
+  await verifyDependencies(path.resolve(path.dirname(process.argv[3]), '..'));
   process.send?.({ ready: true, revision });
 } catch (error) {
   process.send?.({ error: error.message });

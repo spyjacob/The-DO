@@ -1,3 +1,4 @@
+import { createAISources } from '../../src/core/ai-sources.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -38,7 +39,7 @@ async function start(name) {
   const port = probe.address().port; await new Promise(r => probe.close(r));
   const dir = path.join(root, name); await fs.mkdir(dir);
   await fs.writeFile(path.join(dir, 'models.json'), JSON.stringify({ default: name, models: { [name]: {
-    provider: 'openai', model: name, label: name, baseUrl: `http://127.0.0.1:${mock.address().port}/v1`,
+    provider: 'openai', model: name, label: name, supportedEffortLevels:['low','high','max'], defaultEffort:'high', baseUrl: `http://127.0.0.1:${mock.address().port}/v1`,
   } } }));
   const origin = `http://127.0.0.1:${port}`;
   const fixture = path.join(dir, 'jev-fetch.mjs');
@@ -276,6 +277,7 @@ try {
       listen(){}, paintHeader(){}, showBanner(){}, drawTranscript(){}, machinesSheet(){},
       refreshState:async()=>{}, api:route=>a.call(route),
     });
+    vm.runInContext(frontend.slice(frontend.indexOf('function modelEffortLabel('),frontend.indexOf('async function sessionSettingsSheet(')),context);
     vm.runInContext(frontend.slice(frontend.indexOf('let openingSession ='), frontend.indexOf('async function editTranscript(')), context);
     vm.runInContext(frontend.slice(frontend.indexOf('let startupRunning ='), frontend.indexOf('let networkChecking =')), context);
     return {context, location, remembered, traces};
@@ -519,7 +521,7 @@ try {
     $: id => { if (!pendingElements.has(id)) pendingElements.set(id,{querySelector:()=>({}),replaceChildren(){}}); return pendingElements.get(id); },
     api:(route,opts)=>a.call(route,opts.method,JSON.parse(opts.body)),
     showBanner: text => assert.fail(text) });
-  vm.runInContext(frontend.slice(frontend.indexOf('const pendingMessages ='),frontend.indexOf('async function send(queue')),pendingUi);
+  vm.runInContext(frontend.slice(frontend.indexOf('const pendingVersions ='),frontend.indexOf('async function send(queue')),pendingUi);
   pendingUi.message = panelQueued.pending;
   pendingUi.sessionId = s.id;
   vm.runInContext('pendingMessages.set(sessionId,message); paintMessagePending();',pendingUi);
@@ -814,6 +816,30 @@ try {
   assert.ok(chatRequest);
   assert.doesNotMatch(JSON.stringify(chatRequest.messages), /Tracing for future AI work/);
 
+  // Refresh discovery and preserve source-specific levels for existing models.
+  const capabilityDir = path.join(root,'capability-source'); await fs.mkdir(capabilityDir);
+  await fs.writeFile(path.join(capabilityDir,'models.json'),JSON.stringify({models:{native:{provider:'codex-cli',model:'fixture-native',reasoningEffort:'high'}}}));
+  const capabilities = createAISources(capabilityDir,{discoverCodex:async()=>[{model:'fixture-native',label:'Native',supportedEffortLevels:['low','high','xhigh'],defaultEffort:'high',effortSource:'Codex model/list'}]});
+  await capabilities.discover('codex-cli');
+  const nativeCatalog = await capabilities.catalog();
+  assert.deepEqual(nativeCatalog.models.native.effortCapability.levels,['low','high','xhigh']);
+  assert.equal(nativeCatalog.models.native.effortCapability.configured,'high');
+  capabilities.close();
+  // Use the owning model's capabilities, including header and form rendering.
+  const effortInventory = await a.call('/api/models/catalog');
+  assert.deepEqual(effortInventory.models['model-a'].effortCapability.levels,['low','high','max']);
+  const effortUi = vm.createContext({state:{models:effortInventory.models},esc:String});
+  vm.runInContext(frontend.slice(frontend.indexOf('function modelEffortLabel('),frontend.indexOf('async function sessionSettingsSheet(')),effortUi);
+  const effortSession = {model:'model-a',effort:'max'};
+  assert.match(effortUi.modelEffortLabel(effortSession),/max requested/);
+  assert.doesNotMatch(effortUi.effortControl(effortSession),/value="ultra"/);
+  assert.match(effortUi.modelEffortLabel({model:'model-a'}),/provider default.*high/);
+  effortUi.state.models.unknown = {model:'private-model'};
+  assert.match(effortUi.effortControl({model:'unknown'}),/maximum are unknown/);
+  assert.match(effortUi.modelEffortLabel({model:'unknown',effort:'max'}),/unverified/);
+  effortUi.state.models.unsupported = {model:'no-effort',effortCapability:{levels:[],source:'fixture'}};
+  assert.match(effortUi.modelEffortLabel({model:'unsupported'}),/not supported/);
+  assert.equal((await a.request(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'ultra'})).status,400);
   // Session effort is passed through unchanged; message retries do not run twice.
   await a.call(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'max'});
   const message = {text:'effort-and-idempotency',clientMessageId:'stable-message-1'};

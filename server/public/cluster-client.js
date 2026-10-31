@@ -3,8 +3,8 @@
   const storageKey = 'orchestrator-cluster';
   let saved;
   try { saved = JSON.parse(localStorage.getItem(storageKey) || 'null'); } catch { saved = null; }
-  let viewer = localStorage.getItem('orchestrator-viewer');
-  if (!viewer) { viewer = crypto.randomUUID(); localStorage.setItem('orchestrator-viewer', viewer); }
+  let viewer = crypto.randomUUID();
+  try { viewer = localStorage.getItem('orchestrator-viewer') || viewer; localStorage.setItem('orchestrator-viewer', viewer); } catch {}
   let failures = 0, busy = false;
   const originalFetch = window.fetch.bind(window);
   async function check() {
@@ -16,7 +16,8 @@
         signal: AbortSignal.timeout(6000) });
       if (!response.ok) throw new Error('Host unavailable');
       const current = await response.json();
-      saved = current; localStorage.setItem(storageKey, JSON.stringify(current)); failures = 0;
+      saved = current; failures = 0;
+      try { localStorage.setItem(storageKey, JSON.stringify(current)); } catch {}
     } catch {
       failures++;
       if (failures < 3 || !saved?.ticket) return;
@@ -37,7 +38,8 @@
         const current = new URL(location.href);
         const node = current.searchParams.get('node');
         if (node) url.searchParams.set('node', node);
-        const session = current.searchParams.get('session') || sessionStorage.getItem(`lastSession${node ? ':' + node : ''}`);
+        let session = current.searchParams.get('session');
+        try { session ||= sessionStorage.getItem(`lastSession${node ? ':' + node : ''}`); } catch {}
         if (session) url.searchParams.set('session', session);
         // Carry an unsent text draft without ever submitting it automatically.
         const draft = document.getElementById('input')?.value;
@@ -48,7 +50,7 @@
   }
   const incoming = new URLSearchParams(location.search).get('viewer');
   if (incoming && /^[a-zA-Z0-9-]{16,80}$/.test(incoming)) {
-    viewer = incoming; localStorage.setItem('orchestrator-viewer', viewer);
+    viewer = incoming; try { localStorage.setItem('orchestrator-viewer', viewer); } catch {}
   }
   window.addEventListener('DOMContentLoaded', () => {
     if (location.hash.startsWith('#draft=')) {

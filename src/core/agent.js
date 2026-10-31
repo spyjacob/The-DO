@@ -1,3 +1,4 @@
+import { validateEffort } from './model-effort.js';
 /**
  * The agent loop: send the transcript, run whatever tools come back, repeat
  * until the model stops asking for tools.
@@ -28,12 +29,14 @@ import { assistantEvent, noteEvent, toolResultEvent, userEvent } from './transcr
 async function boundedTool(call, ctx, { signal, ms }) {
   let timer;
   let onAbort;
+  const controller = new AbortController();
+  const cancellation = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   try {
     return await Promise.race([
-      runTool(call, ctx),
+      runTool(call, {...ctx, signal:cancellation}),
       new Promise((resolve) => {
         timer = setTimeout(
-          () => resolve({ ok: false, output: `timed out after ${Math.round(ms / 1000)}s — the tool did not return. If it touched ~/Documents, ~/Downloads or ~/Desktop, macOS may be waiting on a permission dialog.` }),
+          () => { controller.abort(); resolve({ ok: false, output: `timed out after ${Math.round(ms / 1000)}s — the tool did not return. If it touched ~/Documents, ~/Downloads or ~/Desktop, macOS may be waiting on a permission dialog. Cancellation was requested; external effects may already have occurred.` }); },
           ms,
         );
       }),
@@ -241,6 +244,7 @@ async function runTurnInner({
     }
 
     const configured = models[session.model];
+    if (configured) validateEffort(configured, session.effort);
     const spec = configured && { ...configured, ...(session.claudePermission ? {permissionMode:session.claudePermission} : {}), ...(session.effort ? { effort: session.effort, reasoningEffort: session.effort } : {}) };
     if (!spec) {
       await append(noteEvent(`model "${session.model}" is not in models.json`));
@@ -267,10 +271,18 @@ async function runTurnInner({
 
     // Resume only an unchanged transcript on the same execution host/folder/model.
     // Editing history or changing providers deliberately starts a fresh native session.
-    const fingerprint = entries => crypto.createHash('sha256').update(JSON.stringify(entries.filter(e => ['user','assistant','tool_result'].includes(e.type)).map(e => [e.id,e.text,e.toolCalls,e.output]))).digest('hex');
+    const fingerprint = entries => crypto.createHash('sha256').update(JSON.stringify(entries.filter(e => ['user','assistant','tool_result'].includes(e.type)).map(e => [e.id,e.text,e.toolCalls,e.output,e.attachments]))).digest('hex');
     const cwd = session.tabWorkspace?.cwd ?? session.tabWorkspace?.dir ?? session.projectDir;
+    // Native identity is only reusable when execution semantics agree. Labels
+    // and credentials are excluded; model definition and access policy are not.
+    const context = crypto.createHash('sha256').update(JSON.stringify({
+      model:spec.model, provider:spec.provider, bin:spec.bin, baseUrl:spec.baseUrl,
+      system:session.system, executionContext, permission:spec.permissionMode || 'default',
+      readableDirs:session.readableDirs || [], confined:session.confineToProjectDir,
+      mode:session.mode, extraBody:spec.extraBody,
+    })).digest('hex');
     const native = session.nativeClaude;
-    const resume = spec.provider === 'claude-cli' && native?.host === session.ownerNode && native?.cwd === cwd && native.model === session.model
+    const resume = spec.provider === 'claude-cli' && native?.host === session.ownerNode && native?.cwd === cwd && native.model === session.model && native.context === context
       && native.history === fingerprint(session.events.filter(e => ['user','assistant','tool_result'].includes(e.type)).slice(0, -1)) ? native.id : null;
     let nativeId;
     let reply;
@@ -316,7 +328,7 @@ async function runTurnInner({
 
     await stepSaves;
     if (nativeId && !reply.error) {
-      session.nativeClaude = {id:nativeId, cwd, host:session.ownerNode, model:session.model, history:fingerprint(session.events)};
+      session.nativeClaude = {id:nativeId, cwd, host:session.ownerNode, model:session.model, context, history:fingerprint(session.events)};
       await save(session);
     }
 
@@ -347,6 +359,11 @@ async function runTurnInner({
 
     const event = await append(assistantEvent(reply));
 
+    if (!usesTools(session) && event.toolCalls.length) {
+      for (const call of event.toolCalls) await append(toolResultEvent({callId:call.id, name:call.name, ok:false, output:'Tool execution denied: this session has tools disabled.'}));
+      await append(noteEvent('The provider returned tool calls in no-tools mode. No tools were executed.'));
+      return {outcome:'error'};
+    }
     if (reply.error) {
       await append(noteEvent(`${spec.alias}: ${reply.error}`));
       return {outcome:'error'};

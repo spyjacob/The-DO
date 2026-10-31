@@ -33,6 +33,7 @@ export async function complete({
     ? budgetOpenAI(toOpenAI(events, system), Math.floor(cap * 0.85 * 3.5))
     : toOpenAI(events, system);
   const body = {
+    ...(spec.extraBody ?? {}),
     model: spec.model,
     messages,
     // A chat-mode session sends no tool definitions at all: on a small model
@@ -45,8 +46,11 @@ export async function complete({
     ...(spec.maxTokens ? { [spec.maxTokensParam ?? 'max_tokens']: spec.maxTokens } : {}),
     ...(spec.temperature != null ? { temperature: spec.temperature } : {}),
     ...(spec.reasoningEffort ? { reasoning_effort: spec.reasoningEffort } : {}),
-    ...(spec.extraBody ?? {}),
   };
+  // Extra provider options cannot override the tool policy or select another model.
+  delete body.tool_choice;
+  delete body.parallel_tool_calls;
+  if (!useTools) delete body.tools;
 
   const started = Date.now();
   const reply = {

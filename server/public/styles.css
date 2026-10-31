@@ -59,8 +59,9 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #title-sub {
+  overflow-wrap: anywhere;
   font-family: var(--mono); font-size: 11px; color: var(--fg-faint);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  white-space: normal;
 }
 
 .tap {

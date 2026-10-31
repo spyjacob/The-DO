@@ -6,6 +6,7 @@
  * Everything else in the app is provider-agnostic.
  */
 
+import crypto from 'node:crypto';
 import * as anthropic from './anthropic.js';
 import * as claudeCli from './claude-cli.js';
 import * as codexCli from './codex-cli.js';
@@ -39,7 +40,7 @@ export function providerFor(spec) {
  * would silently share a client.
  */
 export function clientFor(spec) {
-  const key = [spec.alias, spec.provider, spec.baseUrl ?? '', spec.bin ?? '', spec.apiKey ? 'k' : ''].join(':');
+  const key = [spec.alias, spec.provider, spec.baseUrl ?? '', spec.bin ?? '', crypto.createHash('sha256').update(spec.apiKey || '').digest('hex')].join(':');
   if (!clients.has(key)) clients.set(key, providerFor(spec).makeClient(spec));
   return clients.get(key);
 }

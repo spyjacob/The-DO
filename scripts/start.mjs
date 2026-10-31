@@ -2,7 +2,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
-import crypto from 'node:crypto';
+import { dependencyHash } from './dependency-state.mjs';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -27,15 +27,14 @@ try {
     await fs.writeFile(config, Object.entries(values).map(([k, v]) => `${k}=${JSON.stringify(v.replaceAll('\\', '/'))}`).join('\n') + '\n', { flag: 'wx', mode: 0o600 });
   }
   process.loadEnvFile(config);
-  // Access tokens are off for now; ignore one left behind by an older launcher.
-  delete process.env.HARNESS_TOKEN;
+  // Preserve explicit authentication. Empty-token mode is local-socket only.
   const port = Number(process.env.HARNESS_PORT);
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('HARNESS_PORT must be a port from 1 to 65535.');
   const probe = net.createServer();
   await new Promise((resolve, reject) => { probe.once('error', () => reject(new Error(`Port ${port} is already in use. Stop the existing server or choose another HARNESS_PORT in ${config}.`))); probe.listen(port, '0.0.0.0', resolve); });
   await new Promise((resolve) => probe.close(resolve));
   await startupUpdate(root);
-  const lockHash = crypto.createHash('sha256').update(await fs.readFile('package-lock.json')).digest('hex');
+  const lockHash = await dependencyHash(root);
   const stamp = '.launcher/dependencies.sha256';
   if (await fs.readFile(stamp, 'utf8').catch(() => '') !== lockHash || !await fs.stat('node_modules/cross-spawn/package.json').catch(() => null)) {
     if (process.platform === 'win32') await run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'npm ci']);

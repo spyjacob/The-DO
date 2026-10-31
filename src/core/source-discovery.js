@@ -56,7 +56,7 @@ export async function codexModels({ spawnProcess = spawn, env, timeout = 20000 }
     const models = []; let cursor = null;
     for (let page = 0; page < 20; page++) {
       const result = await send('model/list', { limit: 100, includeHidden: false, cursor });
-      models.push(...(result.data || []).filter(m => !m.hidden).map(m => ({ model: m.model || m.id, label: m.displayName || m.model || m.id })));
+      models.push(...(result.data || []).filter(m => !m.hidden).map(m => ({ model: m.model || m.id, label: m.displayName || m.model || m.id, supportedEffortLevels: m.supportedReasoningEfforts?.map(e => e.reasoningEffort), defaultEffort: m.defaultReasoningEffort, effortSource: 'Codex model/list' })));
       cursor = result.nextCursor;
       if (!cursor) return models;
     }
@@ -80,6 +80,6 @@ export async function claudeModels({ run = runSourceCommand, load = () => import
     const models = await Promise.race([session.supportedModels(), new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('Claude model discovery timed out. Update Claude Code and retry.')), 20000);
     })]);
-    return models.filter(m => !m.disabled).map(m => ({ model: m.value, label: m.displayName || m.value }));
+    return models.filter(m => !m.disabled).map(m => ({ model: m.value, label: m.displayName || m.value, supportsEffort: m.supportsEffort, supportedEffortLevels: m.supportedEffortLevels, effortSource: 'Claude supportedModels' }));
   } finally { clearTimeout(timer); finish(); session.close(); controller.abort(); }
 }

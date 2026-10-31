@@ -1,3 +1,4 @@
+import { atomicFile, serializedFile } from './atomic-file.js';
 /**
  * User- and agent-defined monitors.
  *
@@ -26,10 +27,12 @@ export async function loadMonitors(userDataDir, { session } = {}) {
   let all;
   try {
     const raw = JSON.parse(await fs.readFile(monitorsPath(userDataDir), 'utf8'));
-    all = Array.isArray(raw) ? raw : (raw.monitors ?? []);
-  } catch {
-    return [];
+    all = Array.isArray(raw) ? raw : raw?.monitors;
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw new Error('Monitor registry is unreadable or corrupt; original retained.', {cause:error});
   }
+  if (!Array.isArray(all)) throw new Error('Invalid monitor registry; original retained.');
   if (session === undefined) return all;
   // A monitor with no session is global and shows everywhere; one carrying a
   // session id belongs to that session's own panel.
@@ -39,13 +42,11 @@ export async function loadMonitors(userDataDir, { session } = {}) {
 export async function saveMonitors(userDataDir, monitors) {
   const file = monitorsPath(userDataDir);
   await fs.mkdir(userDataDir, { recursive: true });
-  const tmp = `${file}.tmp`;
-  await fs.writeFile(tmp, `${JSON.stringify(monitors, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, file);
+  await atomicFile(file, `${JSON.stringify(monitors, null, 2)}\n`);
   return monitors;
 }
 
-export async function upsertMonitor(userDataDir, monitor) {
+async function upsertMonitorUnlocked(userDataDir, monitor) {
   if (!monitor?.id) throw new Error('a monitor needs an id');
   if (!KINDS.includes(monitor.kind)) throw new Error(`kind must be one of ${KINDS.join(', ')}`);
 
@@ -56,7 +57,7 @@ export async function upsertMonitor(userDataDir, monitor) {
   return saveMonitors(userDataDir, all);
 }
 
-export async function removeMonitor(userDataDir, id) {
+async function removeMonitorUnlocked(userDataDir, id) {
   const all = await loadMonitors(userDataDir);
   return saveMonitors(userDataDir, all.filter((m) => m.id !== id));
 }
@@ -148,3 +149,7 @@ export async function sample(monitor, { tailBytes = 8000 } = {}) {
 export async function sampleAll(monitors, opts) {
   return Promise.all(monitors.map((m) => sample(m, opts)));
 }
+
+export function upsertMonitor(userDataDir, ...args) { return serializedFile(monitorsPath(userDataDir), () => upsertMonitorUnlocked(userDataDir, ...args)); }
+
+export function removeMonitor(userDataDir, ...args) { return serializedFile(monitorsPath(userDataDir), () => removeMonitorUnlocked(userDataDir, ...args)); }

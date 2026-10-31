@@ -7,12 +7,15 @@ import path from 'node:path';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const dir = path.join(root, 'test/e2e');
 const fixture = new URL('./fixtures/tailscale.mjs', import.meta.url).href;
-const suites = readdirSync(dir).filter(file => file.endsWith('.test.mjs')).sort();
+const suites = [
+  ...readdirSync(dir).filter(file => file.endsWith('.test.mjs')).map(file => path.join(dir, file)),
+  ...readdirSync(path.join(root, 'test')).filter(file => file.endsWith('.test.mjs')).map(file => path.join(root, 'test', file)),
+].sort();
 if (!suites.length) throw new Error('No E2E tests found');
 let failed = 0;
 for (const file of suites) {
   console.log(`E2E: ${file}`);
-  const result = spawnSync(process.execPath, [path.join(dir, file)], {
+  const result = spawnSync(process.execPath, [file], {
     cwd: root, stdio: 'inherit', timeout: 180_000,
     env: { ...process.env, ORCHESTRATOR_TAILSCALE_BIN: process.execPath,
       ORCHESTRATOR_TAILSCALE_SOCKET: '', HARNESS_TEST_TAILSCALE_STATE: '',

@@ -1,3 +1,4 @@
+import { effortCapability } from './model-effort.js';
 import crypto from 'node:crypto';
 /**
  * Model registry. Adding a model is a config edit, never a code edit.
@@ -74,6 +75,7 @@ export async function loadConfig(userDataDir) {
     };
   }
 
+  for (const spec of Object.values(models)) spec.effortCapability = effortCapability(spec);
   const aliases = Object.keys(models);
   if (!aliases.length) {
     return { models, default: null, path: file, error: null };

@@ -1,3 +1,4 @@
+import { atomicFile, serializedFile } from './atomic-file.js';
 /**
  * Apps: the things that actually exist.
  *
@@ -17,6 +18,7 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import { createWriteStream, realpathSync } from 'node:fs';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { renameAppRepo } from './git.js';
@@ -80,8 +82,11 @@ export async function load(userDataDir) {
   let stored = [];
   try {
     const raw = JSON.parse(await fs.readFile(appsPath(userDataDir), 'utf8'));
-    stored = Array.isArray(raw.apps) ? raw.apps : [];
-  } catch { /* none yet */ }
+    if (!raw || !Array.isArray(raw.apps) || raw.apps.some(app => !app || typeof app.id !== 'string' || typeof app.dir !== 'string')) throw Error('Invalid app registry shape');
+    stored = raw.apps;
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw new Error('App registry is unreadable or corrupt; original retained. Restore a verified copy before changing projects.', {cause:error});
+  }
   await Promise.all(stored.map(async (app) => {
     app.hasBeenApp = Boolean(app.start?.trim() || app.lastStartedAt);
     if (app.hasBeenApp) await rememberApp(userDataDir, app);
@@ -94,11 +99,9 @@ export async function load(userDataDir) {
 async function persist(userDataDir, apps) {
   await fs.mkdir(userDataDir, { recursive: true });
   const file = appsPath(userDataDir);
-  const tmp = `${file}.${process.pid}.tmp`;
   // The builtin Harness app is synthesised on load, never stored.
   const toStore = apps.filter((a) => a.id !== HARNESS_APP_ID);
-  await fs.writeFile(tmp, `${JSON.stringify({ apps: toStore }, null, 2)}\n`, 'utf8');
-  await fs.rename(tmp, file);
+  await atomicFile(file, `${JSON.stringify({ apps: toStore }, null, 2)}\n`);
   return apps;
 }
 
@@ -254,7 +257,7 @@ async function pidsOnPort(port) {
   }
 }
 
-export async function create(userDataDir, { name, dir, start = '', repo = null, hosts = null, ownerNode }) {
+async function createUnlocked(userDataDir, { name, dir, start = '', repo = null, hosts = null, ownerNode }) {
   const refusal = refuseAsProjectDir(dir);
   if (refusal) throw new Error(refusal);
   if (!dir) throw new Error('an app needs a directory');
@@ -265,7 +268,7 @@ export async function create(userDataDir, { name, dir, start = '', repo = null, 
   }
 
   const app = {
-    id: `${slug(name)}-${Date.now().toString(36)}`,
+    id: `${slug(name)}-${Date.now().toString(36)}-${crypto.randomUUID().slice(0,8)}`,
     name: name || path.basename(dir),
     dir: path.resolve(dir),
     repo,
@@ -288,7 +291,7 @@ export async function create(userDataDir, { name, dir, start = '', repo = null, 
   return app;
 }
 
-export async function update(userDataDir, id, patch) {
+async function updateUnlocked(userDataDir, id, patch) {
   const apps = await load(userDataDir);
   const app = apps.find((a) => a.id === id);
   if (!app) throw new Error('no such app');
@@ -339,7 +342,7 @@ export async function update(userDataDir, id, patch) {
   return app;
 }
 
-export async function remove(userDataDir, id) {
+async function removeUnlocked(userDataDir, id) {
   const apps = await load(userDataDir);
   const next = apps.filter((a) => a.id !== id);
   await persist(userDataDir, next);
@@ -442,7 +445,7 @@ async function ensureServe(app) {
   }
 }
 
-export async function start(userDataDir, id, { ai = [] } = {}) {
+async function startUnlocked(userDataDir, id, { ai = [] } = {}) {
   const apps = await load(userDataDir);
   const app = apps.find((a) => a.id === id);
   if (!app) throw new Error('no such app');
@@ -536,7 +539,7 @@ async function launchdJobsFor(app) {
   return mine;
 }
 
-export async function stop(userDataDir, id) {
+async function stopUnlocked(userDataDir, id) {
   const apps = await load(userDataDir);
   const app = apps.find((a) => a.id === id);
   if (!app) throw new Error('no such app');
@@ -673,4 +676,24 @@ export async function listWithStatus(userDataDir, localNode) {
       urls: { phone, desktop },
     };
   }));
+}
+
+export function create(userDataDir, ...args) {
+  return serializedFile(appsPath(userDataDir), () => createUnlocked(userDataDir, ...args));
+}
+
+export function update(userDataDir, ...args) {
+  return serializedFile(appsPath(userDataDir), () => updateUnlocked(userDataDir, ...args));
+}
+
+export function remove(userDataDir, ...args) {
+  return serializedFile(appsPath(userDataDir), () => removeUnlocked(userDataDir, ...args));
+}
+
+export function start(userDataDir, ...args) {
+  return serializedFile(appsPath(userDataDir), () => startUnlocked(userDataDir, ...args));
+}
+
+export function stop(userDataDir, ...args) {
+  return serializedFile(appsPath(userDataDir), () => stopUnlocked(userDataDir, ...args));
 }

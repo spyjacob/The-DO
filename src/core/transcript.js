@@ -465,3 +465,20 @@ export function toResponses(events) {
   }
   return input;
 }
+
+/** Soft character budget for Responses items. Preserve every user input and
+ * call/result identity; only replace older tool output, never drop pairs. */
+export function budgetResponses(items, budgetChars) {
+  if (!Number.isFinite(budgetChars)) return items;
+  const out = items.map(item => ({...item}));
+  let size = JSON.stringify(out).length;
+  const newest = out.findLastIndex(item => item.type === 'function_call_output');
+  for (let i = 0; i < out.length && size > budgetChars; i++) {
+    const item = out[i];
+    if (i === newest || item.type !== 'function_call_output' || typeof item.output !== 'string' || item.output.length <= 120) continue;
+    const prior = JSON.stringify(item).length;
+    item.output = `[${item.output.length} characters omitted to reduce context; re-read if needed]`;
+    size += JSON.stringify(item).length - prior;
+  }
+  return out;
+}

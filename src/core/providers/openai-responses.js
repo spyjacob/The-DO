@@ -10,7 +10,7 @@
 
 import OpenAI from 'openai';
 
-import { budgetOpenAI, toResponses } from '../transcript.js';
+import { budgetResponses, toResponses } from '../transcript.js';
 import { toResponsesTools } from '../tools.js';
 
 export const kind = 'openai-responses';
@@ -30,9 +30,10 @@ export async function complete({
   // session has explicitly asked to stay under it.
   const cap = spec.softLimitTokens && !longContext ? spec.softLimitTokens : spec.contextTokens;
   const items = toResponses(events);
-  const input = cap ? budgetOpenAI(items, Math.floor(cap * 0.85 * 3.5)) : items;
+  const input = cap ? budgetResponses(items, Math.floor(cap * 0.85 * 3.5)) : items;
 
   const body = {
+    ...(spec.extraBody ?? {}),
     model: spec.model,
     input,
     stream: true,
@@ -40,8 +41,11 @@ export async function complete({
     ...(useTools ? { tools: toResponsesTools() } : {}),
     ...(spec.maxTokens ? { max_output_tokens: spec.maxTokens } : {}),
     ...(spec.reasoningEffort ? { reasoning: { effort: spec.reasoningEffort } } : {}),
-    ...(spec.extraBody ?? {}),
   };
+  // Extra provider options cannot override the tool policy or select another model.
+  delete body.tool_choice;
+  delete body.parallel_tool_calls;
+  if (!useTools) delete body.tools;
 
   const started = Date.now();
   const reply = {
@@ -108,6 +112,9 @@ export async function complete({
           reply.usage.cached = u.input_tokens_details?.cached_tokens ?? 0;
           reply.usage.cacheWrite = u.input_tokens_details?.cache_write_tokens ?? 0;
           reply.stopReason = event.response?.status ?? null;
+          if (event.type === 'response.incomplete') {
+            reply.error = `Response incomplete: ${event.response?.incomplete_details?.reason || 'unspecified reason'}. Partial output was preserved; execution stopped.`;
+          }
           if (event.type === 'response.failed') {
             reply.error = event.response?.error?.message ?? 'the response failed';
           }
