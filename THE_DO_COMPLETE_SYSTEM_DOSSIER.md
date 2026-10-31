@@ -1,7 +1,9 @@
 # The DO — Complete Technical Architecture and System Intelligence Dossier
 
-**Investigation date:** 30 October 2026.  
-**Source baseline:** `4a65c8cf8d1614097182eb8b9bd7023dfb97faa0`.  
+**Investigation date:** 30 October 2026.
+
+**Source baseline:** `4a65c8cf8d1614097182eb8b9bd7023dfb97faa0`.
+
 **Purpose:** An evidence-based handoff to an architect who does not have repository or runtime access. This is an investigation, not a proposed implementation assignment.
 
 ## Reading this report
