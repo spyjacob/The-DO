@@ -29,6 +29,27 @@ try {
   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));
   assert.match(await page.locator('#title-sub').innerText(), /gpt-6-astra.*max requested/);
   assert.ok(await page.locator('#title-sub').evaluate(el=>el.scrollHeight<=el.clientHeight && el.scrollWidth<=el.clientWidth));
+  await page.evaluate(()=>sessionSourceSheet(state.session));
+  await page.locator('#picker-source').waitFor();
+  const sourceNames=await page.locator('#picker-source').innerText();
+  assert.match(sourceNames,/Claude Code/); assert.match(sourceNames,/Codex/);
+  await page.route('**/api/cluster/sources', async route => {
+    const action=route.request().postDataJSON().action;
+    const models=[{model:'sonnet',label:'Sonnet'},{model:'opus',label:'Opus'}];
+    const body=action==='discover' ? {models} : action==='add' ? {aliases:['sonnet','opus']}
+      : {models:Object.fromEntries(models.map(m=>[m.model,{...m,alias:m.model,provider:'claude-cli'}]))};
+    await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify(body)});
+  });
+  await page.selectOption('#picker-source','claude-cli');
+  await page.locator('[data-picker-model="opus"]').waitFor();
+  assert.equal(await page.locator('[data-picker-model]').count(),2);
+  await page.unroute('**/api/cluster/sources');
+  await page.route('**/api/cluster/sources',route=>route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'OAuth session expired'})}));
+  await page.evaluate(()=>sessionSourceSheet(state.session,'claude-cli'));
+  await page.locator('#picker-retry').waitFor();
+  assert.match(await page.locator('#picker-recovery').innerText(),/claude auth login/);
+  await page.unroute('**/api/cluster/sources');
+  await page.evaluate(()=>closeSheet());
   await page.screenshot({path:`.launcher/hardening-panels-${width}.png`});
   assert.deepEqual(failures,[]);
   console.log(JSON.stringify({width,boxes}));await page.close();

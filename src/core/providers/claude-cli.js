@@ -198,5 +198,8 @@ export async function complete({
       ? 'stopped by user'
       : `claude exited ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 400)}` : ''}`;
   }
+  if (reply.error && /oauth|authentication|authenticate|not logged in|token.*expired/i.test(reply.error)) {
+    reply.error = 'Claude Code login needs attention on this session’s computer. Open session settings → Source → model → Claude Code for sign-in instructions, then retry your message.';
+  }
   return reply;
 }

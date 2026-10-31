@@ -277,7 +277,7 @@ try {
       listen(){}, paintHeader(){}, showBanner(){}, drawTranscript(){}, machinesSheet(){},
       refreshState:async()=>{}, api:route=>a.call(route),
     });
-    vm.runInContext(frontend.slice(frontend.indexOf('function modelEffortLabel('),frontend.indexOf('async function sessionSettingsSheet(')),context);
+    vm.runInContext(frontend.slice(frontend.indexOf('function modelSourceName('),frontend.indexOf('async function sessionSettingsSheet(')),context);
     vm.runInContext(frontend.slice(frontend.indexOf('let openingSession ='), frontend.indexOf('async function editTranscript(')), context);
     vm.runInContext(frontend.slice(frontend.indexOf('let startupRunning ='), frontend.indexOf('let networkChecking =')), context);
     return {context, location, remembered, traces};
@@ -824,18 +824,32 @@ try {
   const nativeCatalog = await capabilities.catalog();
   assert.deepEqual(nativeCatalog.models.native.effortCapability.levels,['low','high','xhigh']);
   assert.equal(nativeCatalog.models.native.effortCapability.configured,'high');
+  await capabilities.add({kind:'codex-cli',models:['fixture-native']});
+  const refreshedCatalog = await capabilities.catalog();
+  assert.equal(Object.keys(refreshedCatalog.models).length,1,'native discovery reuses existing provider aliases');
   capabilities.close();
+  const claudeCatalog = createAISources(capabilityDir,{discoverClaude:async()=>[
+    {model:'sonnet',label:'Sonnet',supportsEffort:true,supportedEffortLevels:['low','high']},
+    {model:'opus',label:'Opus',supportsEffort:true,supportedEffortLevels:['low','high','max']} ]});
+  const discoveredClaude = await claudeCatalog.discover('claude-cli');
+  await claudeCatalog.add({kind:'claude-cli',models:discoveredClaude.models.map(m=>m.model)});
+  const allClaude = Object.values((await claudeCatalog.catalog()).models).filter(m=>m.provider==='claude-cli');
+  assert.equal(allClaude.length,2);
+  assert.deepEqual(allClaude.find(m=>m.model==='opus').effortCapability.levels,['low','high','max']);
+  claudeCatalog.close();
+
   // Use the owning model's capabilities, including header and form rendering.
   const effortInventory = await a.call('/api/models/catalog');
   assert.deepEqual(effortInventory.models['model-a'].effortCapability.levels,['low','high','max']);
   const effortUi = vm.createContext({state:{models:effortInventory.models},esc:String});
-  vm.runInContext(frontend.slice(frontend.indexOf('function modelEffortLabel('),frontend.indexOf('async function sessionSettingsSheet(')),effortUi);
+  vm.runInContext(frontend.slice(frontend.indexOf('function modelSourceName('),frontend.indexOf('async function sessionSettingsSheet(')),effortUi);
   const effortSession = {model:'model-a',effort:'max'};
   assert.match(effortUi.modelEffortLabel(effortSession),/max requested/);
   assert.doesNotMatch(effortUi.effortControl(effortSession),/value="ultra"/);
   assert.match(effortUi.modelEffortLabel({model:'model-a'}),/provider default.*high/);
   effortUi.state.models.unknown = {model:'private-model'};
-  assert.match(effortUi.effortControl({model:'unknown'}),/maximum are unknown/);
+  assert.match(effortUi.effortControl({model:'unknown'}),/no maximum is assumed/);
+  assert.doesNotMatch(effortUi.effortControl({model:'unknown'}), /<input/);
   assert.match(effortUi.modelEffortLabel({model:'unknown',effort:'max'}),/unverified/);
   effortUi.state.models.unsupported = {model:'no-effort',effortCapability:{levels:[],source:'fixture'}};
   assert.match(effortUi.modelEffortLabel({model:'unsupported'}),/not supported/);

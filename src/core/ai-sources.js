@@ -108,7 +108,7 @@ export function createAISources(dir, { request = fetch, discoverClaude = claudeM
         raw.models ||= {};
         const aliases = [];
         for (const m of chosen) {
-          const alias = Object.keys(raw.models).find(id => raw.models[id].sourceKind === kind && raw.models[id].model === m.model)
+          const alias = Object.keys(raw.models).find(id => (raw.models[id].sourceKind || raw.models[id].provider) === kind && raw.models[id].model === m.model)
             || 'source-' + crypto.randomUUID();
           raw.models[alias] = { ...raw.models[alias], sourceKind: kind, provider: kind === 'ollama' ? 'openai' : kind,
             model: m.model, label: m.label, supportsEffort:m.supportsEffort, supportedEffortLevels:m.supportedEffortLevels, defaultEffort:m.defaultEffort, effortSource:m.effortSource, ...(kind === 'ollama' ? { baseUrl: OLLAMA + '/v1', apiKeyOptional: true,

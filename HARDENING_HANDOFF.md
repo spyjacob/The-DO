@@ -276,3 +276,24 @@ catalog metadata; unavailable peers cannot supply current capabilities.
 
 This follow-up addresses the effort selector portion of AG-07. Native permission,
 execution bridge, and durable history work listed above remains outstanding.
+
+
+## Follow-up: source-first model selection and login recovery
+
+Session settings now open a source → model picker for the owning computer.
+Selecting Claude Code or Codex discovers its native catalog and registers every
+reported model, reusing existing provider/model aliases. Discovery failure blocks
+selection from that source and exposes the error, the correct computer, a copyable
+native login command and retry. Login still requires Terminal and browser
+interaction on that computer; this is not an embedded OAuth broker and no live
+account login was performed. Available catalog entries are not a guarantee of
+subscription entitlement or successful inference.
+
+Unknown effort capabilities use a default/saved-value dropdown instead of free
+text. Native capability refresh goes through the same source discovery/recovery
+screen. Selecting a model explicitly resets the old session effort override to
+that model's default, as stated in the picker. The header names the adapter as
+well as model and requested/default effort. New-chat creation separates configured
+sources from their models; source onboarding preselects all discovered models.
+Metadata traces distinguish picker loading, content, empty and error states;
+no login output or account credentials are collected.

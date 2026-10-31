@@ -64,7 +64,7 @@ try {
     fetch: () => appReply ? Promise.resolve(Response.json(appReply)) : request('/api/apps'),
   });
   vm.runInContext(previewSource, preview);
-  await pause(100);
+  for (let i = 0; i < 100 && !element('preview-status').textContent; i++) await pause(50);
   assert.match(element('preview-status').textContent, /stopped/);
   assert.equal(traces.at(-1).outcome, 'error');
   appReply = { apps: [{ id: 'demo', name: 'Demo', running: true, reachable: true, urls: { desktop: 'http://127.0.0.1:4321' } }] };
