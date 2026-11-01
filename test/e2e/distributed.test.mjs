@@ -911,7 +911,7 @@ try {
     throw Error('Native turn did not finish');
   };
   for (let turn=0;turn<2;turn++) {
-    await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask me'});
+    await a.call(`/api/sessions/${native.id}/send`,'POST',{text:turn === 0 ? 'HISTORY-MARKER ' + 'old conversation '.repeat(12000) + ' ask me' : 'ask me'});
     const question = await waitQuestion();
     assert.equal(question.kind,'question');
     assert.equal((await b.request(`/api/sessions/${native.id}/interaction`,'POST',{id:question.id,allow:true,answers:{}})).status,400);
@@ -922,8 +922,21 @@ try {
     const reply = JSON.parse(saved.events.findLast(e=>e.type === 'assistant').text);
     assert.equal(reply.resumed,turn === 1,'native history resumes after the first turn');
     assert.equal(reply.effort,'max');
+    assert.ok(reply.promptLength < 45000);
+    if (turn === 0) assert.equal(reply.historyReadable,true);
+    if (reply.historyFile) await assert.rejects(fs.stat(reply.historyFile), {code:'ENOENT'});
     assert.equal(reply.answer.updatedInput.answers['Which behavior?'],'Keep');
   }
+  const oversizedChat = await a.call('/api/sessions','POST',{name:'large import',model:'native-test',mode:'chat',projectDir:path.join(root,'native-project')});
+  await a.call(`/api/sessions/${oversizedChat.id}/send`,'POST',{text:'large history '.repeat(12000)});
+  let rejectedChat;
+  for (let i=0;i<100;i++) {
+    rejectedChat = await a.call(`/api/sessions/${oversizedChat.id}`);
+    if (rejectedChat.events.some(e=>e.type==='note' && /searchable history handoff/.test(e.text))) break;
+    await pause();
+  }
+  assert.ok(rejectedChat.events.some(e=>e.type==='note' && /searchable history handoff/.test(e.text)));
+  assert.equal(rejectedChat.events.find(e=>e.type==='user').text,'large history '.repeat(12000).trim());
   await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask permission'});
   const permission = await waitQuestion();
   assert.equal(permission.kind,'permission');

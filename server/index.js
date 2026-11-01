@@ -646,6 +646,7 @@ async function dispatchMessage(id, body, reply) {
         // Any sign of life counts: a token, a tool starting, a tool ending.
         beacons.touch(id, delta.kind === 'tool_start' ? `${delta.call?.name} ${describeArg(delta.call)}` : delta.kind);
         if (delta.kind === 'tool_start') turn.last = delta.call?.name ?? null;
+        if (delta.kind === 'native_context') usageHistory?.record('turn.native-context', {correlationId:body.traceId, outcome:delta.outcome, count:delta.count});
         if (delta.kind === 'tool_end') usageHistory?.record('turn.tool', { correlationId: body.traceId, outcome: delta.result?.ok ? 'ok' : 'error' });
         if (delta.kind === 'rate_limit') {
           usageHistory?.record('turn.rate-limit', { correlationId: body.traceId });

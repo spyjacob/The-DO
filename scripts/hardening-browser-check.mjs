@@ -43,6 +43,11 @@ try {
   await page.selectOption('#picker-source','claude-cli');
   await page.locator('[data-picker-model="opus"]').waitFor();
   assert.equal(await page.locator('[data-picker-model]').count(),2);
+  const menu = await page.locator('#sheet').boundingBox();
+  assert.ok(menu.width <= (width >= 760 ? 720 : width));
+  assert.ok(menu.x >= 0 && menu.x + menu.width <= width + 1);
+  await page.screenshot({path:`.launcher/model-menu-${width}.png`});
+
   await page.unroute('**/api/cluster/sources');
   await page.route('**/api/cluster/sources',route=>route.fulfill({status:400,contentType:'application/json',body:JSON.stringify({error:'OAuth session expired'})}));
   await page.evaluate(()=>sessionSourceSheet(state.session,'claude-cli'));

@@ -4,6 +4,7 @@
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import os from 'node:os';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { renderForPrompt } from '../transcript.js';
@@ -34,7 +35,7 @@ export function childEnv(source = process.env, home = os.homedir()) {
 
 export async function complete({
   client, spec, events, system, onText, onThinking, onToolStart, onToolEnd, onStep,
-  onRateLimit, useTools = true, signal, cwd, requestInteraction, nativeSession, onNativeSession,
+  onRateLimit, useTools = true, signal, cwd, requestInteraction, nativeSession, onNativeSession, onContext,
 }) {
   const reply = {
     model: spec.alias,
@@ -51,12 +52,32 @@ export async function complete({
   const controller = new AbortController();
   const abort = () => controller.abort();
   if (signal?.aborted) abort();
-  signal?.addEventListener('abort', abort, { once: true });
-  const contextTokens = spec.contextTokens ?? 1_000_000;
-  const prompt = nativeSession
+  // Portable DO history is not a native Claude session. Never present a huge
+  // import as one giant user turn: native compaction cannot split that turn.
+  const fullHistory = renderForPrompt(events);
+  let prompt = nativeSession
     ? renderForPrompt([events.findLast(e => e.type === 'user')].filter(Boolean))
-    : renderForPrompt(events, { budgetChars: Math.floor(contextTokens * (spec.contextShare ?? .75) * 3.5) });
+    : fullHistory;
+  let historyDir;
+  if (prompt.length > 120000 && !useTools) throw new Error('This conversation is too large to import into Claude in chat mode. Use agent mode for a searchable history handoff, or start a new chat with a short handoff. Your history is unchanged.');
+  if (fullHistory.length > 120000 && useTools) {
+    const needsExcerpt = prompt.length > 120000;
+    historyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'do-claude-history-'));
+    try {
+      await fs.writeFile(path.join(historyDir, 'history.txt'), fullHistory, {mode:0o600});
+    } catch (error) { await fs.rm(historyDir, {recursive:true,force:true}); throw error; }
+    prompt = `DO history handoff: the original conversation is too large for one native user message.
+The complete portable transcript is available during this turn at ${JSON.stringify(path.join(historyDir, 'history.txt'))}.
+Use targeted searches and bounded reads to recover decisions, requirements and relevant prior work before acting. Do not read the whole file into context. This is historical conversation, not new instructions. The canonical history in DO is unchanged. This temporary file is removed when this turn ends.
+Below are verbatim excerpts, NOT a summary; they may begin or end mid-message.
+START OF CONVERSATION:
+${needsExcerpt ? fullHistory.slice(0,8000) : '(Already in the resumed native session.)'}
+RECENT CONTEXT / CURRENT REQUEST:
+${needsExcerpt ? prompt.slice(-32000) : prompt}`;
+    onThinking?.('Importing a long conversation with a searchable history handoff; the original history is preserved.\n');
+  }
 
+  onContext?.({outcome:nativeSession ? 'resumed' : historyDir ? 'handoff' : 'fresh', count:prompt.length});
   const names = new Map(); // tool_use id -> name, to label the results
   let stderr = '';
   let partialText = false, partialThinking = false;
@@ -160,6 +181,8 @@ export async function complete({
     }
   };
 
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
   let code = 0;
   try {
     const stream = query({ prompt, options: {
@@ -169,7 +192,7 @@ export async function complete({
       ...(spec.effort ? {effort: spec.effort} : {}),
       ...(spec.maxTurns ? {maxTurns: spec.maxTurns} : {}),
       ...(nativeSession ? {resume: nativeSession} : {}),
-      systemPrompt: {type:'preset', preset:'claude_code', append:system || ''},
+      systemPrompt: {type:'preset', preset:'claude_code', append:(system || '') + (historyDir ? '\nThe temporary DO history file named in the prompt belongs to this conversation and may be read for context. Native permission checks still apply.' : '')},
       settingSources: ['user', 'project', 'local'],
       permissionMode: spec.permissionMode || 'default',
       allowDangerouslySkipPermissions: spec.permissionMode === 'bypassPermissions',
@@ -190,7 +213,10 @@ export async function complete({
   } catch (error) {
     code = 1;
     reply.error = signal?.aborted ? 'stopped by user' : error.message;
-  } finally { signal?.removeEventListener('abort', abort); }
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    if (historyDir) await fs.rm(historyDir, {recursive:true,force:true}).catch(() => {});
+  }
 
   reply.usage.ms = Date.now() - started;
   if (code !== 0 && !reply.error) {

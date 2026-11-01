@@ -297,3 +297,31 @@ well as model and requested/default effort. New-chat creation separates configur
 sources from their models; source onboarding preselects all discovered models.
 Metadata traces distinguish picker loading, content, empty and error states;
 no login output or account credentials are collected.
+
+
+## Claude history imports and desktop menus
+
+Fresh Claude sessions previously received the portable transcript as one unbounded
+user message (the transcript budget intentionally never dropped user text). Native
+compaction cannot fix that initial giant exchange. Imports over 120,000 characters
+now use explicitly labeled opening/recent excerpts and a private temporary full
+transcript for targeted native reads; the original DO history is never edited.
+The same searchable archive is recreated for resumed turns with long portable
+history, and deleted after each turn, including errors and cancellation. A process
+crash may leave a private OS temporary directory. No transcript is committed or
+written to diagnostics. This is an import handoff, not a semantic summary or a
+claim that all old context is immediately loaded. Oversized chat-mode imports
+fail with an actionable message because tools are disabled. Native resume remains
+in use for compatible sessions; model changes still require a fresh import.
+Provider tools/settings can independently exhaust context; this change does not
+promise to prevent every provider context-limit error.
+
+`turn.native-context` logs fresh/handoff/resumed and prompt character count,
+without prompt content. Reproduce by switching a long DO chat to Claude, then
+sending a follow-up; expect handoff then resumed. E2E uses the installed SDK with
+an isolated CLI peer to verify bounded input, readable original history, effort
+pass-through and resume. Live account inference was not exercised.
+
+Desktop menus use a centered 720px dialog and content-sized action buttons;
+phones retain bottom sheets. Source model choices form two columns on desktop
+and one on phones. Browser checks cover 390px and 1280px layouts and login errors.

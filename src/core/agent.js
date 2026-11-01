@@ -300,6 +300,7 @@ async function runTurnInner({
         client: clientFor(spec),
         requestInteraction,
         nativeSession: resume,
+        onContext: info => onDelta?.({kind:'native_context', ...info}),
         onNativeSession: id => { nativeId = id; },
         spec,
         events,
