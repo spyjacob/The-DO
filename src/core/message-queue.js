@@ -2,10 +2,12 @@
 // Pending messages are intentionally not persisted across a server restart.
 export function createMessageQueue() {
   const active = new Map();
+  const held = new Set(); // paused sessions: queued messages wait for release()
   async function drain(id, entry, task) {
     try { await task.run(); }
     catch (e) { task.onError(e); }
     finally {
+      if (held.has(id) && entry.next.length) { entry.idle = true; return; }
       const next = entry.next.shift();
       if (next) void drain(id, entry, next);
       else active.delete(id);
@@ -21,13 +23,27 @@ export function createMessageQueue() {
       body.text = text;
       return body;
     },
-    cancel(id, expected) { const entry = active.get(id); if (entry) entry.next = expected ? entry.next.filter(task => task.body.pendingId !== expected) : []; },
-    submit(id, run, { queue = false, onError = () => {}, body = null } = {}) {
+    cancel(id, expected) {
+      const entry = active.get(id);
+      if (!entry) return;
+      entry.next = expected ? entry.next.filter(task => task.body.pendingId !== expected) : [];
+      if (entry.idle && !entry.next.length) active.delete(id);
+    },
+    hold(id) { held.add(id); },
+    release(id) {
+      held.delete(id);
+      const entry = active.get(id);
+      if (!entry?.idle) return;
+      entry.idle = false;
+      const next = entry.next.shift();
+      if (next) void drain(id, entry, next); else active.delete(id);
+    },
+    submit(id, run, { queue = false, front = false, onError = () => {}, body = null } = {}) {
       const entry = active.get(id);
       const task = { run, onError, body };
       if (entry) {
         if (!queue) throw new Error('A turn is already running. Use Queue next.');
-        entry.next.push(task);
+        entry.next[front ? 'unshift' : 'push'](task);
       } else {
         const fresh = { next: [] };
         active.set(id, fresh);

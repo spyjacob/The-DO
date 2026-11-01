@@ -31,8 +31,9 @@ export async function modelInventory(config, probe = executableAvailable) {
       availability: installed === false ? `${bin} is not installed on this computer`
         : !spec.hasKey ? 'No API key configured' : 'Configured; sign-in and service access are unverified' };
   }
-  return { models, default: models[config.default]?.available ? config.default
-    : Object.keys(models).find(id => models[id].available) || null };
+  const def = models[config.default]?.available ? config.default
+    : Object.keys(models).find(id => models[id].available) || null;
+  return { models, default: def, defaultEffort: def === config.default ? config.defaultEffort || null : null };
 }
 
 /** Claude interprets a bounded diagnostic snapshot, with no filesystem or shell tools. */

@@ -82,7 +82,9 @@ export async function loadConfig(userDataDir) {
   }
 
   const def = models[raw.default] ? raw.default : aliases[0];
-  return { models, default: def, path: file, error: null };
+  // A default effort belongs to the chosen default model; a fallback default gets none.
+  const defaultEffort = def === raw.default && typeof raw.defaultEffort === 'string' ? raw.defaultEffort : null;
+  return { models, default: def, defaultEffort, path: file, error: null };
 }
 
 const writes = new Map();

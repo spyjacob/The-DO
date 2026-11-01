@@ -617,6 +617,36 @@ try {
   }
   assert.ok(!finished.turnHost);
   assert.deepEqual(finished.events.filter(e=>e.type === 'user').map(e=>e.text), ['wait','fifo-one','fifo-edited']);
+  // Pause stops the running turn but holds queued messages; Resume continues first, then runs the queue.
+  release = null;
+  await a.call(`/api/sessions/${s.id}/send`, 'POST', { text: 'wait' });
+  for (let i = 0; i < 80 && !release; i++) await pause();
+  await a.call(`/api/sessions/${s.id}/queue`, 'POST', { text: 'after-pause' });
+  assert.equal((await a.request(`/api/sessions/${s.id}/resume`, 'POST', {})).status, 409, 'nothing to resume before a pause');
+  await a.call(`/api/sessions/${s.id}/pause`, 'POST', {});
+  let pausedState;
+  for (let i = 0; i < 80; i++) {
+    pausedState = await a.call(`/api/sessions/${s.id}`);
+    if (!pausedState.turnHost && pausedState.events.filter(e=>e.type === 'user').length >= 4) break;
+    await pause();
+  }
+  await pause(); await pause();
+  pausedState = await a.call(`/api/sessions/${s.id}`);
+  assert.equal(pausedState.paused, true);
+  assert.deepEqual((await a.call(`/api/sessions/${s.id}/pending`)).pending.map(m=>m.text), ['after-pause'], 'queued message waits while paused');
+  assert.ok(!modelRequests.some(r=>r.messages.at(-1)?.content === 'after-pause'));
+  release(); release = null;
+  await a.call(`/api/sessions/${s.id}/resume`, 'POST', {});
+  let resumed;
+  for (let i = 0; i < 100; i++) {
+    resumed = await a.call(`/api/sessions/${s.id}`);
+    if (!resumed.busy && !resumed.turnHost && resumed.events.filter(e=>e.type === 'user').length >= 6) break;
+    await pause();
+  }
+  assert.equal(resumed.paused, false);
+  const resumedUsers = resumed.events.filter(e=>e.type === 'user').map(e=>e.text);
+  assert.match(resumedUsers.at(-2), /^Resume: the previous turn was paused/);
+  assert.equal(resumedUsers.at(-1), 'after-pause', 'the held queue runs after the continuation');
   assert.equal((await a.call(`/api/sessions/${s.id}/pending`)).pending.length,0);
   assert.equal(finished.ownerNode, b.status.self);
   assert.ok(finished.events.some(e => e.type === 'assistant' && e.text === 'model-b'));
@@ -844,15 +874,22 @@ try {
   const effortUi = vm.createContext({state:{models:effortInventory.models},esc:String});
   vm.runInContext(frontend.slice(frontend.indexOf('function modelSourceName('),frontend.indexOf('async function sessionSettingsSheet(')),effortUi);
   const effortSession = {model:'model-a',effort:'max'};
-  assert.match(effortUi.modelEffortLabel(effortSession),/max requested/);
-  assert.doesNotMatch(effortUi.effortControl(effortSession),/value="ultra"/);
-  assert.match(effortUi.modelEffortLabel({model:'model-a'}),/provider default.*high/);
+  assert.equal(effortUi.modelEffortLabel(effortSession),'Local · model-a · max');
+  // The model wizard groups sources by provider and names the chosen model and effort.
+  assert.equal(effortUi.modelGroup(effortInventory.models['model-a']),'local','a loopback endpoint is a Local model');
+  assert.equal(effortUi.modelGroup({provider:'claude-cli'}),'claude');
+  assert.equal(effortUi.modelGroup({provider:'openai',baseUrl:'https://api.openai.com/v1'}),'openai');
+  assert.equal(vm.runInContext(`modelChoiceLabel(state.models['model-a'],'max')`,effortUi),'model-a · max effort');
+  assert.equal(effortUi.modelEffortLabel({model:'model-a'}),'Local · model-a','no effort shown unless one is set');
+  effortUi.state.models.claude = {provider:'claude-cli',model:'opus',label:'Opus',effortCapability:{levels:['low','high']}};
+  assert.equal(effortUi.modelEffortLabel({model:'claude',effort:'high'}),'Claude · Subscription · Opus · high');
+  effortUi.state.models.gpt = {provider:'openai-responses',model:'gpt-x',baseUrl:'https://api.openai.com/v1'};
+  assert.equal(effortUi.modelEffortLabel({model:'gpt'}),'OpenAI · API · gpt-x');
   effortUi.state.models.unknown = {model:'private-model'};
-  assert.match(effortUi.effortControl({model:'unknown'}),/no maximum is assumed/);
-  assert.doesNotMatch(effortUi.effortControl({model:'unknown'}), /<input/);
-  assert.match(effortUi.modelEffortLabel({model:'unknown',effort:'max'}),/unverified/);
+  assert.match(effortUi.modelEffortLabel({model:'unknown',effort:'max'}),/private-model · max$/);
   effortUi.state.models.unsupported = {model:'no-effort',effortCapability:{levels:[],source:'fixture'}};
-  assert.match(effortUi.modelEffortLabel({model:'unsupported'}),/not supported/);
+  assert.equal(effortUi.modelEffortLabel({model:'unsupported'}),'no-effort','a model without effort shows none');
+  assert.match(effortUi.modelEffortLabel({model:'claude',effort:'max'}),/max \(unsupported\)$/);
   assert.equal((await a.request(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'ultra'})).status,400);
   // Session effort is passed through unchanged; message retries do not run twice.
   await a.call(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'max'});
@@ -868,6 +905,21 @@ try {
   assert.equal(modelRequests.filter(r=>r.messages.at(-1)?.content === message.text).length,1);
   assert.equal(modelRequests.find(r=>r.messages.at(-1)?.content === message.text).reasoning_effort,'max');
   assert.equal((await a.request(`/api/sessions/${traceSession.id}`, 'PATCH', {effort:'invented'})).status,400);
+
+  // Settings → Default model: each computer's default model and effort seed new sessions.
+  assert.equal((await a.request('/api/cluster/sources','POST',{host:b.status.self,action:'default',alias:'model-b',effort:'invented'})).status,400,'remote default effort is validated by its computer');
+  await a.call('/api/cluster/sources','POST',{host:a.status.self,action:'default',alias:'model-a',effort:'low'});
+  assert.equal((await a.call('/api/cluster/sources','POST',{host:a.status.self,action:'catalog'})).defaultEffort,'low');
+  const defaulted = await a.call('/api/sessions','POST',{name:'defaulted',projectDir:path.join(root,'default-project'),mode:'chat'});
+  assert.equal(defaulted.model,'model-a');
+  assert.equal(defaulted.effort,'low');
+  const picked = await a.call('/api/sessions','POST',{name:'picked',projectDir:path.join(root,'default-project'),mode:'chat',model:'model-a',effort:'max'});
+  assert.equal(picked.effort,'max','New session keeps the effort chosen in the wizard');
+  assert.equal((await a.request('/api/sessions','POST',{name:'bad',projectDir:path.join(root,'default-project'),mode:'chat',model:'model-a',effort:'invented'})).status,400);
+  // The wizard's last step switches model and effort in one change.
+  assert.equal((await a.call(`/api/sessions/${picked.id}`,'PATCH',{model:'model-a',effort:'high'})).effort,'high');
+  await a.call('/api/cluster/sources','POST',{host:a.status.self,action:'default',alias:'model-a',effort:''});
+  assert.equal((await a.call('/api/cluster/sources','POST',{host:a.status.self,action:'catalog'})).defaultEffort,null);
 
   const longTurn = await a.call('/api/sessions','POST',{name:'long turn',projectDir:path.join(root,'long-project'),model:'model-a',mode:'agent'});
   await a.call(`/api/sessions/${longTurn.id}/send`,'POST',{text:'continue-past-forty'});
@@ -956,6 +1008,24 @@ try {
   assert.equal(liveMessages.filter(event=>event.kind === 'delta' && event.delta.kind === 'text').length,1,'partial text is not duplicated by the final native event');
   const declined = await waitNativeDone(3);
   assert.equal(JSON.parse(declined.events.findLast(e=>e.type === 'assistant').text).answer.behavior,'deny');
+  // Always allow sends back Claude's own suggested rule; Allow everything raises the session's mode.
+  await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask permission always'});
+  const alwaysRequest = await waitQuestion();
+  assert.deepEqual(alwaysRequest.always,['Bash(echo fixture)'],'the prompt names the rule Always allow adds');
+  assert.equal((await b.request(`/api/sessions/${native.id}/interaction`,'POST',{id:alwaysRequest.id,allow:true,scope:'forever'})).status,400);
+  await b.call(`/api/sessions/${native.id}/interaction`,'POST',{id:alwaysRequest.id,allow:true,scope:'always'});
+  const allowedAlways = JSON.parse((await waitNativeDone(4)).events.findLast(e=>e.type === 'assistant').text).answer;
+  assert.equal(allowedAlways.behavior,'allow');
+  assert.deepEqual(allowedAlways.updatedPermissions,[{type:'addRules',rules:[{toolName:'Bash',ruleContent:'echo fixture'}],behavior:'allow',destination:'localSettings'}]);
+  await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask permission everything'});
+  const everythingRequest = await waitQuestion();
+  await b.call(`/api/sessions/${native.id}/interaction`,'POST',{id:everythingRequest.id,allow:true,scope:'all'});
+  const everything = await waitNativeDone(5);
+  assert.deepEqual(JSON.parse(everything.events.findLast(e=>e.type === 'assistant').text).answer.updatedPermissions,[{type:'setMode',mode:'bypassPermissions',destination:'session'}]);
+  assert.equal(everything.claudePermission,'bypassPermissions','Allow everything applies to later turns');
+  assert.equal((await a.call(`/api/sessions/${native.id}`,'PATCH',{claudePermission:'auto'})).claudePermission,'auto');
+  assert.equal((await a.request(`/api/sessions/${native.id}`,'PATCH',{claudePermission:'everything'})).status,400);
+  await a.call(`/api/sessions/${native.id}`,'PATCH',{claudePermission:'default'});
   await a.call(`/api/sessions/${native.id}/send`,'POST',{text:'ask again'});
   await waitQuestion();
   await b.call(`/api/sessions/${native.id}/stop`,'POST',{});

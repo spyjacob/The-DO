@@ -852,7 +852,9 @@ function paintHeader() {
     ? modelEffortLabel(s)
     : 'pick a session';
   $('send').disabled = !t.session || sessionOffline(t.session);
-  $('input').placeholder = idlePlaceholder();
+  $('model-gear').hidden = !s;
+  $('model-gear').disabled = !s || sessionOffline(s);
+  $('input').placeholder = cur().paused ? pausedPlaceholder : idlePlaceholder();
   const model = s && state.models[s.model];
   if (sessionOffline(s)) {
     const owner = state.machines?.hosts?.find(h => h.id === s.ownerNode);
@@ -885,7 +887,18 @@ function paintComposerAction() {
   const hasDraft = Boolean($('input').value.trim()) || pendingShots.length > 0;
   $('send').hidden = busy;
   $('stop').hidden = !busy || hasDraft;
+  $('pause').hidden = !busy || hasDraft || Boolean(cur().paused);
   $('queue').hidden = !busy || !hasDraft;
+}
+
+// Paused: the turn was stopped on purpose and queued messages are held until Resume.
+function setPaused(on, tab = state.tab) {
+  tabs[tab].paused = on;
+  if (tab !== state.tab) return;
+  $('paused').hidden = !on;
+  $('input').placeholder = on ? pausedPlaceholder : tabs[tab].running ? 'Write a follow-up, then tap Queue next…' : idlePlaceholder();
+  paintComposerAction();
+  window.harnessTrace?.('visible', { screen: 'paused', outcome: on ? 'shown' : 'cleared' });
 }
 
 function setRunning(on, startedAt = null, last = null, tab = state.tab) {
@@ -895,12 +908,13 @@ function setRunning(on, startedAt = null, last = null, tab = state.tab) {
   if (tab !== state.tab) return;   // background tab: remember, do not repaint
   paintComposerAction();
   $('working').hidden = !on;
-  $('input').placeholder = on ? 'Write a follow-up, then tap Queue next…' : idlePlaceholder();
+  $('input').placeholder = on ? 'Write a follow-up, then tap Queue next…' : tabs[tab].paused ? pausedPlaceholder : idlePlaceholder();
   if (on) startClock(startedAt); else stopClock();
   if (changed) drawTranscript();
 }
 
 const idlePlaceholder = () => 'Describe what to build…';
+const pausedPlaceholder = 'Paused — tap Resume, or send a message to continue with it…';
 
 
 
@@ -955,6 +969,7 @@ function listen(tab, id) {
   const t = tabs[tab];
   t.stream?.close();
   showInteraction(null, id);
+  setPaused(false, tab);
   const es = new EventSource(nodeApi(`/api/sessions/${id}/events`));
   t.stream = es;
 
@@ -964,6 +979,8 @@ function listen(tab, id) {
     const active = tab === state.tab;
     if (p.kind === 'interaction') { if (active) showInteraction(p.request, id); return; }
     if (p.kind === 'hello' && active) showInteraction(p.interaction, id);
+    if (p.kind === 'paused') { setPaused(Boolean(p.paused), tab); return; }
+    if (p.kind === 'hello') setPaused(Boolean(p.paused), tab);
 
     if (p.kind === 'pending' && p.starting && t.session) {
       t.session.events.push({id:'pending-' + p.starting.pendingId, ts:Date.now(), type:'user', text:p.starting.text, attachments:p.starting.attachments, clientMessageId:p.starting.clientMessageId, optimistic:true});
@@ -1048,15 +1065,20 @@ function showInteraction(request, sessionId) {
       <p class="dim">${(q.options || []).map(o => esc(o.label) + ': ' + esc(o.description || '')).join('<br>')}</p>
       <textarea data-answer="${i}" placeholder="Type your answer or option names"></textarea>`).join('')
       : `<p>${esc(request.tool)}</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow:auto"></pre>`}
-    <div class="actions"><button class="primary" data-approve>${questions.length ? 'answer' : 'allow once'}</button><button class="ghost" data-decline>decline</button></div>
+    ${request.always?.length ? `<p class="dim">Always allow adds Claude’s rule: ${request.always.map(esc).join(', ')}</p>` : ''}
+    <div class="actions interaction-actions"><button class="primary" data-approve>${questions.length ? 'answer' : 'allow once'}</button>
+      ${request.always?.length ? '<button class="ghost" data-scope="always">always allow</button>' : ''}
+      ${request.kind === 'permission' ? '<button class="ghost" data-scope="all" title="No more prompts in this session; full access on its computer">allow everything</button>' : ''}
+      <button class="ghost" data-decline>decline</button></div>
     <p class="dim" data-error></p></details>`;
   if (!questions.length) box.querySelector('pre').textContent = JSON.stringify(request.input, null, 2);
-  const respond = async allow => {
+  const respond = async (allow, scope) => {
     box.querySelectorAll('button').forEach(b => b.disabled = true);
     try {
       const answers = Object.fromEntries(questions.map((q,i) => [q.question, box.querySelector(`[data-answer="${i}"]`).value]));
-      await api(`/api/sessions/${sessionId}/interaction`, {method:'POST', body:JSON.stringify({id:request.id,allow,answers})});
-      window.harnessTrace?.('visible', {screen:'provider-request',outcome:allow ? 'answered' : 'declined',correlationId:request.id});
+      await api(`/api/sessions/${sessionId}/interaction`, {method:'POST', body:JSON.stringify({id:request.id,allow,answers,...(scope ? {scope} : {})})});
+      window.harnessTrace?.('visible', {screen:'provider-request',outcome:allow ? scope || 'answered' : 'declined',correlationId:request.id});
+      if (scope === 'all' && cur().session?.id === sessionId) showBanner('Allow everything is on for this session. Change it under Session → Claude access.');
       if (box.dataset.request === request.id) showInteraction(null, sessionId);
     } catch(e) {
       if (box.dataset.request !== request.id) return;
@@ -1066,6 +1088,7 @@ function showInteraction(request, sessionId) {
   };
   box.querySelector('[data-approve]').onclick = () => respond(true);
   box.querySelector('[data-decline]').onclick = () => respond(false);
+  box.querySelectorAll('[data-scope]').forEach(b => { b.onclick = () => respond(true, b.dataset.scope); });
   window.harnessTrace?.('visible', {screen:'provider-request',outcome:request.kind,correlationId:request.id});
 }
 
@@ -1355,7 +1378,8 @@ async function newSheet() {
     </select>
     <label>Name</label><input id="n-name" placeholder="${esc(nextTabName(draft.appId))}" />
     <div id="n-computer-row" hidden><label>Computer</label><select id="n-computer"></select></div>
-    <label>Source</label><select id="n-source" disabled><option>Select a computer</option></select><label>Model</label><select id="n-model" disabled><option value="">Select a computer</option></select>
+    <label>Model</label>
+    <div class="rowlinks"><button class="rowlink" id="n-model" disabled><span class="choice-text"><span id="n-model-label">Select a computer</span><small id="n-model-source"></small></span><span class="chev">›</span></button></div>
     <label>Mode</label>
     <select id="n-mode">
       <option value="agent">agent — tools, works in a project folder</option>
@@ -1371,15 +1395,17 @@ async function newSheet() {
   if (draft.name) $('n-name').value = draft.name;
   if (draft.system) $('n-sys').value = draft.system;
   if (draft.dir) $('n-dir').value = draft.dir;
-  if (draft.model && state.models[draft.model]) $('n-model').value = draft.model;
   if (draft.mode) $('n-mode').value = draft.mode;
+  // The model row shows what the session will start with; the wizard changes it.
+  let chosen = { alias: '', effort: '' }, inventory = null;
 
   const keep = () => {
     draft = {
       ownerNode: $('n-computer').value || undefined,
       appId: $('n-app').value || null,
       name: $('n-name').value, system: $('n-sys').value,
-      dir: $('n-dir').value, model: $('n-model').value, mode: $('n-mode').value,
+      dir: $('n-dir').value, model: chosen.alias, effort: chosen.effort, mode: $('n-mode').value,
+      claudePermission: draft.claudePermission,
     };
   };
 
@@ -1403,34 +1429,46 @@ async function newSheet() {
     const request = ++modelRequest;
     $('n-go').disabled = true;
     $('n-model').disabled = true;
-    $('n-model').innerHTML = '<option value="">Loading models for this computer…</option>';
+    $('n-model-label').textContent = 'Loading models for this computer…';
+    $('n-model-source').textContent = '';
     const current = () => request === modelRequest && $('n-computer') === computerSelect;
     if (!computerSelect.value) {
-      $('n-model').innerHTML = '<option value="">No computer available</option>';
+      $('n-model-label').textContent = 'No computer available';
       return;
     }
     try {
-      const inventory = await api(`/api/execution-models?app=${encodeURIComponent($('n-app').value)}&host=${encodeURIComponent($('n-computer').value)}`);
+      inventory = await api(`/api/execution-models?app=${encodeURIComponent($('n-app').value)}&host=${encodeURIComponent($('n-computer').value)}`);
       if (!current()) return;
-      const sources = [...new Set(Object.values(inventory.models).map(m => m.sourceKind || m.provider))];
-      $('n-source').innerHTML = sources.map(kind => `<option value="${esc(kind)}">${esc(modelSourceName({provider:kind,sourceKind:kind}))}</option>`).join('');
-      $('n-source').disabled = !sources.length;
-      const preferred = inventory.models[draft.model] || inventory.models[inventory.default];
-      if (preferred) $('n-source').value = preferred.sourceKind || preferred.provider;
-      const filterModels = () => {
-        const models = Object.values(inventory.models).filter(m => (m.sourceKind || m.provider) === $('n-source').value);
-        $('n-model').innerHTML = models.map(m => `<option value="${esc(m.alias)}" ${m.available === false ? 'disabled' : ''}>${esc(m.label || m.model)}${m.available === false ? ' — unavailable' : ''}</option>`).join('');
-        if (models.some(m => m.alias === preferred?.alias && m.available !== false)) $('n-model').value = preferred.alias;
-        $('n-model').disabled = !models.length;
-        $('n-go').disabled = !$('n-model').value;
-      };
-      $('n-source').onchange = filterModels;
-      filterModels();
+      // A model picked earlier wins; otherwise this computer's default and its effort.
+      chosen = inventory.models[draft.model]?.available !== false && inventory.models[draft.model]
+        ? { alias: draft.model, effort: draft.effort || '' }
+        : { alias: inventory.default || '', effort: inventory.defaultEffort || '' };
+      const model = inventory.models[chosen.alias];
+      $('n-model-label').textContent = model ? modelChoiceLabel(model, chosen.effort || model.effortCapability?.configured) : 'No available models — set up AI sources';
+      $('n-model-source').textContent = model ? modelSourceName(model) + (model.provider === 'claude-cli' ? ` · ${accessTitle(draft.claudePermission || model.permissionMode)}` : '') : '';
+      // Tool-less local models can only chat.
+      $('n-mode').querySelector('[value="agent"]').disabled = model?.supportsTools === false;
+      if (model?.supportsTools === false) $('n-mode').value = 'chat';
+      $('n-model').disabled = false;
+      $('n-go').disabled = !model;
     } catch (e) {
       if (!current()) return;
-      $('n-model').innerHTML = '<option value="">Cannot load this computer’s models</option>';
+      $('n-model-label').textContent = 'Cannot load this computer’s models';
       showBanner(e.message);
     }
+  };
+  $('n-model').onclick = () => {
+    keep();
+    modelWizard({ host: $('n-computer').value, alias: chosen.alias, current: inventory?.models[chosen.alias], effort: chosen.effort,
+      permission: draft.claudePermission || inventory?.models[chosen.alias]?.permissionMode || 'default',
+      purpose: 'New session', exit: newSheet,
+      save(alias, effort, model, permission) {
+        draft.model = alias; draft.effort = effort;
+        if (permission) draft.claudePermission = permission;
+        if (model.supportsTools === false) draft.mode = 'chat';
+        else if (draft.mode === 'chat' && inventory?.models[chosen.alias]?.supportsTools === false) draft.mode = 'agent';
+        return '';
+      } });
   };
   $('n-computer').onchange = loadComputerModels;
   const applyApp = () => {
@@ -1476,7 +1514,9 @@ async function newSheet() {
           appId: $('n-app').value || null,
           ownerNode: $('n-computer').value || undefined,
           name: $('n-name').value.trim() || nextTabName($('n-app').value),
-          model: $('n-model').value,
+          model: chosen.alias,
+          effort: chosen.effort,
+          ...(inventory?.models[chosen.alias]?.provider === 'claude-cli' && draft.claudePermission ? { claudePermission: draft.claudePermission } : {}),
           mode: $('n-mode').value,
           projectDir: chosen,
           system: $('n-sys').value,
@@ -1531,6 +1571,7 @@ async function settingsSheet() {
   openSheet(`
     <h2>Distributed Orchestrator settings</h2>
     <div class="rowlinks">
+      <button class="rowlink" id="h-default-model"><span>Default model</span><span class="dim" id="h-default-label">›</span></button>
       <button class="rowlink" id="h-github"><span>GitHub connection</span><span class="chev">›</span></button>
       <button class="rowlink" id="h-network"><span>Phone access · Tailscale</span><span class="chev">›</span></button>
       <button class="rowlink" id="h-machines"><span>Machines</span><span class="chev">›</span></button>
@@ -1543,6 +1584,17 @@ async function settingsSheet() {
     </div>
     <div class="actions"><button class="primary" id="s-close">done</button></div>`);
 
+  // New sessions on this computer start with this model and effort.
+  const defaultHost = nativeFetch('/api/cluster/status').then(r => r.json()).then(status => status.self);
+  const label = $('h-default-label');
+  defaultHost.then(host => hostSources(host, 'catalog')).then(catalog => {
+    if ($('h-default-label') === label) label.textContent = `${modelChoiceLabel(catalog.models[catalog.default], catalog.defaultEffort)} ›`;
+  }).catch(() => {});
+  $('h-default-model').onclick = async () => {
+    window.harnessTrace?.('action', { control: 'default-model' });
+    try { await modelWizard(await defaultModelTarget(await defaultHost, settingsSheet)); }
+    catch (e) { showBanner(e.message, true); }
+  };
   $('h-history').onclick = () => historySheet();
   $('h-github').onclick = githubSheet;
   $('h-machines').onclick = machinesSheet;
@@ -1751,111 +1803,237 @@ function modelSourceName(model = {}) {
     || (model.sourceKind === 'ollama' ? 'Ollama · local models' : model.provider || 'Unknown source');
 }
 
+// Header line: Claude / OpenAI / Local · Subscription / API · model · effort (when set).
 function modelEffortLabel(session) {
   const model = state.models[session.model];
-  if (!model) return `Model: ${session.model} · effort: unavailable`;
+  if (!model) return `${session.model} · not on this computer`;
+  const group = MODEL_GROUPS.find(g => g.id === modelGroup(model));
+  const access = !['claude','openai'].includes(group?.id) ? '' : ['claude-cli','codex-cli'].includes(model.provider) ? 'Subscription' : 'API';
   const cap = model.effortCapability;
-  const requested = session.effort || cap?.configured;
-  const effort = requested ? `${requested} requested${cap?.levels == null ? ' (unverified)' : cap.levels.includes(requested) ? '' : ' (unsupported)'}`
-    : cap?.levels?.length === 0 ? 'not supported' : `provider default${cap?.default ? ' (' + cap.default + ')' : ' (unknown)'}`;
-  return `${modelSourceName(model)} · ${model.model || model.label || session.model} · effort: ${effort}`;
+  const effort = session.effort || cap?.configured;
+  const unsupported = effort && cap?.levels && !cap.levels.includes(effort) ? ' (unsupported)' : '';
+  return [group?.name || model.provider, access, model.label || model.model || session.model, effort && effort + unsupported].filter(Boolean).join(' · ');
 }
 
-function effortControl(session) {
-  const cap = state.models[session.model]?.effortCapability;
-  const selected = session.effort || '';
-  if (cap?.levels == null) return `<select id="s-effort"><option value="">Provider default</option>${selected ? `<option selected value="${esc(selected)}">${esc(selected)} — saved, unverified</option>` : ''}</select>
-    <p class="dim">Supported levels have not been loaded. Check the source below to load this model’s choices; no maximum is assumed.</p>`;
-  const values = ['', ...cap.levels, ...(selected && !cap.levels.includes(selected) ? [selected] : [])];
-  return `<select id="s-effort">${values.map(level => `<option value="${esc(level)}"${selected === level ? ' selected' : ''}>${esc(level ? level + (!cap.levels.includes(level) ? ' — unsupported; change this' : '') : 'Model default' + (cap.configured ? ' (' + cap.configured + ' configured)' : cap.default ? ' (' + cap.default + ')' : ''))}</option>`).join('')}</select>
-    <p class="dim">${cap.levels.length ? 'Supported by this model: ' + esc(cap.levels.join(', ')) : 'This model reports no effort control.'} Source: ${esc(cap.source)}. Values are sent unchanged; requested effort is not provider confirmation.</p>`;
+// Provider → model → effort, shared by the header gear, Edit session, New
+// session and the default in Settings. Nothing is saved until the last choice,
+// so closing the sheet at any step leaves everything as it was.
+const MODEL_GROUPS = [
+  {id:'claude', name:'Claude', hint:'Claude Code login or Anthropic API key', discover:'claude-cli', login:'claude auth login'},
+  {id:'openai', name:'OpenAI', hint:'Codex login or OpenAI API', discover:'codex-cli', login:'codex login'},
+  {id:'local', name:'Local', hint:'Ollama models on this computer', discover:'ollama'},
+];
+function modelGroup(m = {}) {
+  if (m.sourceKind === 'ollama' || /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/i.test(m.baseUrl || '')) return 'local';
+  if (['claude-cli','anthropic'].includes(m.provider)) return 'claude';
+  if (['codex-cli','openai','openai-responses'].includes(m.provider)) return 'openai';
+  return null;
+}
+// Claude Code permission modes, offered for Claude Code sessions only.
+const CLAUDE_ACCESS = [
+  {mode:'default', title:'Ask each time', detail:'Claude asks here before risky actions'},
+  {mode:'acceptEdits', title:'Accept edits', detail:'File edits go through; other actions still ask'},
+  {mode:'auto', title:'Auto', detail:'A safety classifier approves or blocks each action without asking; needs a Claude plan with auto mode'},
+  {mode:'bypassPermissions', title:'Allow everything', detail:'No prompts; full access on this computer, including outside the project'},
+  {mode:'plan', title:'Plan only', detail:'Claude plans but changes nothing'},
+];
+const accessTitle = mode => CLAUDE_ACCESS.find(a => a.mode === (mode || 'default'))?.title || mode;
+const modelChoiceLabel = (model, effort) => model ? `${model.label || model.model}${effort ? ` · ${effort} effort` : ''}` : 'No model chosen';
+
+async function hostSources(host, action, args = {}) {
+  const response = await nativeFetch('/api/cluster/sources', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host,action,...args})});
+  const result = await response.json();
+  if (!response.ok) throw Error(result.error || 'Source unavailable');
+  return result;
 }
 
-let modelPickerRequest = 0;
-async function sessionSourceSheet(session, kind = '') {
-  const request = ++modelPickerRequest;
-  const host = session.ownerNode;
+/** What the wizard changes: a live session. */
+function sessionModelTarget(session, exit = closeSheet) {
+  return {host:session.ownerNode, alias:session.model, current:state.models[session.model], effort:session.effort || '',
+    permission:session.claudePermission || state.models[session.model]?.permissionMode || 'default',
+    purpose:'This session', exit, live:() => cur().session?.id === session.id,
+    async save(alias, effort, model, permission) {
+      const patch = {model:alias, effort, ...(permission ? {claudePermission:permission} : {})};
+      // Tool-less local models can only chat; leaving one returns to agent mode.
+      if (model.supportsTools === false) patch.mode = 'chat';
+      else if (session.mode === 'chat' && state.models[session.model]?.supportsTools === false) patch.mode = 'agent';
+      const updated = await api(`/api/sessions/${session.id}`, {method:'PATCH', body:JSON.stringify(patch)});
+      if (cur().session?.id === session.id) { cur().session = updated; state.session = updated; }
+      // New source rows must reach state.models before the header can name them.
+      const inventory = await api(`/api/sessions/${session.id}/models`).catch(() => null);
+      if (inventory?.models && state.session?.id === session.id) state.models = inventory.models;
+      if (state.session?.id === session.id) drawTranscript();
+      return `Now using ${modelChoiceLabel(model, effort)}${patch.mode === 'chat' ? ' · chat only' : ''}${permission ? ` · ${accessTitle(permission)}` : ''}.`;
+    }};
+}
+
+/** What the wizard changes: the model and effort new sessions start with on one computer. */
+async function defaultModelTarget(host, exit) {
+  const catalog = await hostSources(host, 'catalog');
+  const machine = catalog.machine?.name || 'this computer';
+  return {host, alias:catalog.default, current:catalog.models[catalog.default], effort:catalog.defaultEffort || '',
+    purpose:`Default for new sessions on ${machine}`, exit,
+    async save(alias, effort, model) {
+      await hostSources(host, 'default', {alias, effort});
+      return `New sessions on ${machine} start with ${modelChoiceLabel(model, effort)}.`;
+    }};
+}
+
+let modelWizardRequest = 0;
+async function modelWizard(target, choice = {}) {
+  const request = ++modelWizardRequest;
+  const exit = target.exit || closeSheet;
+  const host = target.host;
   const machine = state.machines?.hosts?.find(h => h.id === host)?.name || host || 'This computer';
-  const kinds = [...new Set(['claude-cli','codex-cli', ...Object.values(state.models).map(m => m.sourceKind || m.provider)])];
-  openSheet(`<h2>Source → model</h2><p class="dim">${esc(machine)} · login and models belong to this computer.</p>
-    <label>Source</label><select id="picker-source"><option value="">Choose a source</option>${kinds.map(k => `<option value="${esc(k)}" ${k === kind ? 'selected' : ''}>${esc(modelSourceName({provider:k,sourceKind:k}))}</option>`).join('')}</select>
-    <p id="picker-status" role="status">Choose a source to see its models.</p><div id="picker-models"></div>
-    <div id="picker-recovery" hidden></div><button class="ghost" id="picker-back">back</button>`);
-  const select = $('picker-source');
-  const current = () => request === modelPickerRequest && $('picker-source') === select && cur().session?.id === session.id;
-  select.onchange = () => sessionSourceSheet(session, select.value);
-  $('picker-back').onclick = sessionSettingsSheet;
-  if (!kind) return;
-  const call = async (action, args = {}) => {
-    const response = await nativeFetch('/api/cluster/sources', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({host,action,...args})});
-    const result = await response.json();
-    if (!response.ok) throw Error(result.error || 'Source unavailable');
-    return result;
+  const group = MODEL_GROUPS.find(g => g.id === choice.group);
+  let models = choice.models;
+  const model = models?.[choice.alias];
+  // Access is a fourth step for Claude Code models when the target has a permission setting.
+  const needsAccess = m => target.permission !== undefined && m?.provider === 'claude-cli';
+  const step = !group ? 0 : !model ? 1 : !choice.effortDone ? 2 : 3;
+  const stepName = ['provider','model','effort','access'][step];
+  const names = ['Provider','Model','Effort', ...((model ? needsAccess(model) : target.permission !== undefined && group?.id === 'claude') ? ['Access'] : [])];
+  const current = target.current;
+  const live = () => request === modelWizardRequest && sheetView === 'model-wizard' && (target.live?.() ?? true);
+  const crumbs = [group?.name, model && (model.label || model.model)].filter(Boolean).map(esc).join(' › ');
+  openSheet(`<div class="wizard-head"><ol class="wizard-steps">${names.map((name, i) =>
+      `<li class="${i === step ? 'on' : i < step ? 'done' : ''}">${name}</li>`).join('')}</ol>
+      <button class="tap" id="wizard-close" aria-label="Close without changing the model">✕</button></div>
+    <h2>${['Choose a provider','Choose a model','Choose effort','Choose access'][step]}</h2>
+    <p class="dim">${esc(target.purpose || machine)} · ${crumbs || `now ${esc(modelChoiceLabel(current, target.effort))}`}</p>
+    <p id="wizard-status" role="status" hidden></p>
+    <div id="wizard-choices" class="choice-grid"></div>
+    <div id="wizard-recovery" hidden></div>
+    ${step ? '<div class="actions"><button class="ghost" id="wizard-back">back</button></div>' : ''}`, 'model-wizard');
+  window.harnessTrace?.('visible', {screen:'model-wizard', outcome:stepName, provider:group?.id});
+  $('wizard-close').onclick = () => { window.harnessTrace?.('action', {control:'model-wizard-close', outcome:stepName}); exit(); };
+  const hasEffort = Boolean(model?.effortCapability?.levels?.length);
+  if ($('wizard-back')) $('wizard-back').onclick = () => modelWizard(target,
+    step === 3 ? (hasEffort ? {...choice, effortDone:false} : {...choice, alias:null, effortDone:false}) : step === 2 ? {...choice, alias:null} : {});
+  const status = text => { if (live()) { $('wizard-status').hidden = false; $('wizard-status').textContent = text; } };
+  const choices = (items, pick) => {
+    $('wizard-choices').innerHTML = items.map((item, i) => `<button class="rowlink${item.on ? ' on' : ''}" data-choice="${i}"><span>${esc(item.title)}</span><span>${esc(item.detail)}</span></button>`).join('');
+    $('wizard-choices').querySelectorAll('[data-choice]').forEach(button => { button.onclick = () => pick(items[button.dataset.choice]); });
   };
-  try {
-    $('picker-status').textContent = 'Checking source and loading models…';
-    window.harnessTrace?.('visible',{screen:'model-picker',outcome:'loading'});
-    if (['claude-cli','codex-cli'].includes(kind)) {
-      const found = await call('discover',{kind});
-      if (!current()) return;
-      if (found.models.length) await call('add',{kind,models:found.models.map(m => m.model)});
+  const recovery = () => {
+    const box = $('wizard-recovery'); box.hidden = false;
+    box.innerHTML = group.login
+      ? `<p>If the login expired, reconnect on <b>${esc(machine)}</b>:</p><ol><li>Open Terminal on that computer.</li><li>Run <code>${group.login}</code> and finish the browser sign-in.</li><li>Return here and check again.</li></ol><p class="dim">DO cannot renew a provider login itself. Never paste credentials here. API-key models are added in Settings → AI sources.</p><div class="actions"><button class="ghost" id="wizard-copy">copy login command</button><button class="primary" id="wizard-retry">check again</button></div>`
+      : `<p>Install Ollama on <b>${esc(machine)}</b> and download a model with <code>ollama pull &lt;model&gt;</code>, then check again.</p><div class="actions"><button class="primary" id="wizard-retry">check again</button></div>`;
+    if ($('wizard-copy')) $('wizard-copy').onclick = async () => { try { await navigator.clipboard.writeText(group.login); $('wizard-copy').textContent = 'copied'; } catch { status('Copy the command shown above into Terminal.'); } };
+    $('wizard-retry').onclick = () => modelWizard(target, {group:group.id});
+  };
+  // After effort: the Access step for Claude Code, otherwise save.
+  const next = (alias, effort) => needsAccess(models[alias])
+    ? modelWizard(target, {...choice, models, alias, effort, effortDone:true}) : apply(alias, effort);
+  async function apply(alias, effort, permission) {
+    $('wizard-choices').querySelectorAll('button').forEach(b => { b.disabled = true; });
+    status('Saving…');
+    try {
+      const message = await target.save(alias, effort, models[alias], permission);
+      window.harnessTrace?.('visible', {screen:'model-wizard', outcome:'applied', provider:group.id, effort:effort || 'default'});
+      if (request === modelWizardRequest && sheetView === 'model-wizard') await exit();
+      if (message) { paintHeader(); showBanner(message); }
+    } catch (e) {
+      window.harnessTrace?.('visible', {screen:'model-wizard', outcome:'apply-error', provider:group.id});
+      if (!live()) return showBanner(e.message, true);
+      status(e.message);
+      $('wizard-choices').querySelectorAll('button').forEach(b => { b.disabled = false; });
     }
-    const catalog = await call('catalog');
-    if (!current()) return;
-    const models = Object.values(catalog.models).filter(m => (m.sourceKind || m.provider) === kind);
-    $('picker-status').textContent = models.length ? 'Choose a model. Your conversation stays here. Effort resets to the model default.' : 'No models reported. Set up this source in Settings → AI sources.';
-    $('picker-models').innerHTML = models.map(m => `<button class="rowlink" data-picker-model="${sourceAttr(m.alias)}"><span>${esc(m.label || m.model)}</span><span>${esc(m.model)}</span></button>`).join('');
-    window.harnessTrace?.('visible',{screen:'model-picker',outcome:models.length ? 'content' : 'empty'});
-    $('picker-models').querySelectorAll('[data-picker-model]').forEach(button => {
-      button.onclick = async () => {
-        button.disabled = true;
-        try {
-          const updated = await api(`/api/sessions/${session.id}`,{method:'PATCH',body:JSON.stringify({model:button.dataset.pickerModel,effort:''})});
-          if (!current()) return;
-          cur().session = state.session = updated;
-          await sessionSettingsSheet(); paintHeader();
-        } catch(e) { if (current()) { $('picker-status').textContent=e.message; button.disabled=false; } }
-      };
-    });
-  } catch(e) {
-    if (!current()) return;
-    $('picker-status').textContent = e.message;
-    window.harnessTrace?.('visible',{screen:'model-picker',outcome:'error'});
-    const recovery = $('picker-recovery'); recovery.hidden=false;
-    const command = kind === 'claude-cli' ? 'claude auth login' : 'codex login';
-    recovery.innerHTML = `<p>For an expired login, reconnect on <b>${esc(machine)}</b>:</p><ol><li>Open Terminal on that computer.</li><li>Run <code>${command}</code> and finish the browser sign-in.</li><li>Return here and check again.</li></ol><p class="dim">DO cannot renew an expired provider login itself. No credentials should be pasted here. A subscription’s available models are reported by its source.</p><div class="actions"><button class="ghost" id="picker-copy">copy login command</button><button class="primary" id="picker-retry">check again</button></div>`;
-    $('picker-copy').onclick=async()=>{try{await navigator.clipboard.writeText(command);$('picker-copy').textContent='copied';}catch{$('picker-status').textContent='Copy the command shown above into Terminal.';}};
-    $('picker-retry').onclick=()=>sessionSourceSheet(session,kind);
   }
+
+  if (step === 0) return choices(MODEL_GROUPS.map(g => ({...g, title:g.name, on:modelGroup(current) === g.id,
+    detail:g.hint + (modelGroup(current) === g.id ? ' · current' : '')})), g => modelWizard(target, {group:g.id}));
+
+  if (step === 1) {
+    let refreshError = null;
+    if (!models) {
+      status(`Loading ${group.name} models on ${machine}…`);
+      try { models = (await hostSources(host, 'catalog')).models; }
+      catch (e) { if (live()) { status(e.message); recovery(); } window.harnessTrace?.('visible', {screen:'model-wizard', outcome:'error', provider:group.id}); return; }
+      try {
+        const found = await hostSources(host, 'discover', {kind:group.discover});
+        // Re-adding a saved local model would reset its helper setting, so only new ones are added.
+        const saved = Object.values(models).filter(m => (m.sourceKind || m.provider) === group.discover).map(m => m.model);
+        const fresh = found.models.map(m => m.model).filter(m => group.id !== 'local' || !saved.includes(m));
+        if (fresh.length) { await hostSources(host, 'add', {kind:group.discover, models:fresh}); models = (await hostSources(host, 'catalog')).models; }
+      } catch (e) { refreshError = e; }
+      if (!live()) return;
+    }
+    const list = Object.entries(models).filter(([, m]) => modelGroup(m) === group.id);
+    window.harnessTrace?.('visible', {screen:'model-wizard', outcome:list.length ? 'models' : refreshError ? 'error' : 'empty', provider:group.id});
+    if (!list.length) { status(refreshError?.message || `No ${group.name} models on ${machine} yet.`); return recovery(); }
+    status(refreshError ? `Couldn’t refresh ${group.name}: ${refreshError.message} Showing saved models.` : group.id === 'local' ? 'Local models without tool support run in chat mode.' : 'Your conversation stays here.');
+    return choices(list.map(([alias, m]) => ({alias, title:m.label || m.model, on:alias === target.alias,
+      detail:[m.label && m.label !== m.model ? m.model : '', modelSourceName(m), m.supportsTools === false ? 'chat only' : '', alias === target.alias ? 'current' : ''].filter(Boolean).join(' · ')})), item => {
+      const levels = models[item.alias].effortCapability?.levels;
+      if (levels?.length) return modelWizard(target, {...choice, models, alias:item.alias});
+      // No effort step: keep a saved override only when the model is unchanged and its levels are unknown.
+      next(item.alias, item.alias === target.alias && levels == null ? target.effort || '' : '');
+    });
+  }
+
+  if (step === 3) {
+    status('How much Claude may do without asking. Prompts can also switch this.');
+    return choices(CLAUDE_ACCESS.map(a => ({...a, on:a.mode === target.permission, detail:a.detail + (a.mode === target.permission ? ' · current' : '')})),
+      item => apply(choice.alias, choice.effort, item.mode));
+  }
+  const cap = model.effortCapability;
+  const kept = choice.alias === target.alias ? target.effort || '' : null;
+  status('Higher effort thinks longer before answering.');
+  choices(['', ...cap.levels].map(level => ({level, title:level || 'Default', on:level === kept,
+    detail:[level ? '' : cap.configured ? `${cap.configured} configured` : cap.default || 'provider chooses', level === kept ? 'current' : ''].filter(Boolean).join(' · ')})),
+    item => next(choice.alias, item.level));
 }
 
 async function sessionSettingsSheet() {
   try { await refreshState(); } catch (e) { if (executionNode) return machinesSheet(); throw e; }
   const session = cur().session;
-  openSheet(`
-    ${session ? `<h2>Edit session</h2>
-      <label>Name</label>
-      <div class="row"><input id="s-name" value="${esc(session.name ?? '')}" spellcheck="false" />
-      <button class="ghost" id="s-rename" style="flex:0 0 80px">rename</button></div>
-      ${(state.apps?.find(a => a.id === session.appId)?.executionHosts?.length || 0) > 1 ? `
-        <label>Computer</label>
-        <div id="s-computers">${state.machines.hosts.filter(h => state.apps.find(a => a.id === session.appId).executionHosts.includes(h.id)).map(h => `
-          <button class="rowlink" data-tab-computer="${esc(h.id)}" ${session.tabWorkspace || session.turnHost ? 'disabled' : ''}><span>${h.number} · ${esc(h.name)}</span><span class="dim">${h.id === session.ownerNode ? 'owns this tab' : h.active ? 'use computer' : 'offline'}</span></button>`).join('')}</div>
-        <p class="dim">Each tab uses its computer’s models and files. To work on another computer after this tab has started, create a new tab there.</p>` : ''}
-      <p class="dim">${state.models[session.model]?.provider === 'claude-cli' ? 'Claude Code SDK: native tools, interactive questions and permissions, and native history on this host.' : state.models[session.model]?.provider === 'codex-cli' ? 'Codex exec: native tools, transcript replay each turn. Native interactive approvals are not yet supported by this adapter; check its sandbox configuration before running host actions.' : 'API model: DO tools and transcript. Native Claude Code / Codex extensions are not available through this API adapter.'}</p>
-      <label>Computer</label><p>${esc(state.machines?.hosts?.find(h => h.id === session.ownerNode)?.name || session.ownerNode || 'This computer')}</p>
-      <button class="rowlink" id="s-choose-model"><span>Source → model</span><span>${esc(modelSourceName(state.models[session.model]))} ›</span></button>
-      ${state.models[session.model]?.provider === 'claude-cli' ? `<label>Claude permissions</label><select id="s-permission">${['default','acceptEdits','plan','bypassPermissions'].map(mode => `<option value="${mode}"${(session.claudePermission || state.models[session.model]?.permissionMode || 'default') === mode ? ' selected' : ''}>${{default:'Ask when needed',acceptEdits:'Accept edits; ask for other permissions',plan:'Plan only',bypassPermissions:'Full host access — no permission prompts'}[mode]}</option>`).join('')}</select><p class="dim">Claude asks through this chat. Full host access allows actions outside the project on the session’s computer.</p>` : ''}
-      <p class="dim">${(() => { const model = state.models[session.model] || {}; return `Turn steps: no DO cutoff. Output limit: ${model.maxTokens || (model.provider === 'anthropic' ? '32,000 tokens per response' : 'provider default')}.${model.maxTurns ? ` Native turn limit configured: ${model.maxTurns}.` : ''}`; })()}</p>
-      <label>Reasoning effort</label>
-      ${effortControl(session)}
-      <div class="actions"><button class="ghost" id="s-effort-save">save effort</button>${['codex-cli','claude-cli'].includes(state.models[session.model]?.provider) ? '<button class="ghost" id="s-effort-refresh">refresh supported levels</button>' : ''}</div>
-      <label>Mode</label>
-      <div class="row">
-        <button class="ghost${session.mode !== 'chat' ? ' on' : ''}" data-mode="agent">agent</button>
-        <button class="ghost${session.mode === 'chat' ? ' on' : ''}" data-mode="chat">chat</button>
-      </div>
-      <p class="dim">chat sends no tools and no project rules — much less context, better for plain questions.</p>
+  if (!session) {
+    openSheet(`<h2>Session</h2><p class="dim">No session open.</p><div class="actions"><button class="primary" id="s-close">done</button></div>`);
+    $('s-close').onclick = closeSheet;
+    return;
+  }
+  const model = state.models[session.model];
+  const chatOnly = model?.supportsTools === false;
+  const owner = state.machines?.hosts?.find(h => h.id === session.ownerNode);
+  const app = state.apps?.find(a => a.id === session.appId);
+  const others = (state.machines?.hosts || []).filter(h => h.id !== session.ownerNode && app?.executionHosts?.includes(h.id));
+  const stuck = session.tabWorkspace ? 'This tab has Git work on its computer, so it stays there. Start a new tab on another computer to work there.'
+    : session.turnHost ? 'Wait for the current turn to finish before moving this tab.' : '';
+  openSheet(`<h2>Session</h2>
+    <label>Name</label>
+    <div class="row"><input id="s-name" value="${esc(session.name ?? '')}" spellcheck="false" />
+    <button class="ghost" id="s-rename" style="flex:0 0 80px">rename</button></div>
+
+    <label>Computer</label>
+    <p>Runs on <b>${esc(owner?.name || session.ownerNode || 'this computer')}</b>${owner && !owner.active ? ' · offline' : ''}</p>
+    ${others.length ? `<div id="s-computers">${others.map(h => `
+      <button class="rowlink" data-tab-computer="${esc(h.id)}" ${stuck || !h.active ? 'disabled' : ''}><span>${h.number} · ${esc(h.name)}</span><span class="dim">${h.active ? 'move here' : 'offline'}</span></button>`).join('')}</div>
+      <p class="dim">${esc(stuck || 'Moving uses that computer’s models and files; the conversation comes along.')}</p>`
+      : '<p class="dim">Only this computer is enabled for this project. Add computers in the project’s Machines settings.</p>'}
+
+    <label>Model</label>
+    <div class="rowlinks"><button class="rowlink" id="s-choose-model"><span class="choice-text"><span>${esc(modelChoiceLabel(model, session.effort || model?.effortCapability?.configured))}</span><small>${esc(model ? modelSourceName(model) : session.model + ' · not on this computer')}</small></span><span class="chev">›</span></button></div>
+    <div class="row mode-row">
+      <button class="ghost${session.mode !== 'chat' ? ' on' : ''}" data-mode="agent"${chatOnly ? ' disabled' : ''}>agent</button>
+      <button class="ghost${session.mode === 'chat' ? ' on' : ''}" data-mode="chat">chat</button>
+    </div>
+    <p class="dim">${chatOnly ? 'This local model has no tool support, so it can only chat.' : 'Agent works in the project with tools. Chat sends no tools or project rules — lighter, for plain questions.'}</p>
+    ${model?.provider === 'claude-cli' ? `<label>Claude access</label><select id="s-permission">${CLAUDE_ACCESS.map(a => `<option value="${a.mode}"${(session.claudePermission || model.permissionMode || 'default') === a.mode ? ' selected' : ''}>${esc(a.title)} — ${esc(a.detail)}</option>`).join('')}</select><p class="dim">Prompts in the chat also offer Always allow and Allow everything.</p>` : ''}
+    ${model?.softLimitTokens ? (() => {
+      const on = Boolean(session.allowLongContext);
+      return `<label>Context band</label>
+        <div class="row">
+          <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(model.softLimitTokens)}</button>
+          <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(model.contextTokens)}</button>
+        </div>
+        <p class="dim">${esc(model.label ?? model.alias)} reprices the whole request past
+          ${compact(model.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
+          output to fit; allowing it keeps everything and pays the higher rate.</p>`;
+    })() : ''}
+
+    <details class="github-details"><summary>Folders and details</summary>
       <label>Project folder${session.projectDirMissing ? ' — missing!' : ''}</label>
       <div class="row"><input id="s-dir" value="${esc(session.projectDir)}" spellcheck="false" />
       <button class="ghost" id="s-browse" style="flex:0 0 92px">browse</button></div>
@@ -1865,106 +2043,65 @@ async function sessionSettingsSheet() {
         placeholder="/Users/you/Projects/otherProject">${esc((session.readableDirs ?? []).join('\n'))}</textarea>
       <p class="dim">Let the agent’s file tools read reference material outside this project without granting write access. Enter one folder per line; leave empty if unneeded.</p>
       <div class="actions"><button class="ghost" id="s-readable-save">save folders</button></div>
-
-      ${(() => {
-        const m = state.models[session.model];
-        if (!m?.softLimitTokens) return '';
-        const on = Boolean(session.allowLongContext);
-        return `<label>Context band</label>
-          <div class="row">
-            <button class="ghost${on ? '' : ' on'}" data-band="off">stay under ${compact(m.softLimitTokens)}</button>
-            <button class="ghost${on ? ' on' : ''}" data-band="on">allow up to ${compact(m.contextTokens)}</button>
-          </div>
-          <p class="dim">${esc(m.label ?? m.alias)} reprices the whole request past
-            ${compact(m.softLimitTokens)} input tokens — roughly double. Staying under trims old tool
-            output to fit; allowing it keeps everything and pays the higher rate.</p>`;
-      })()}` : ''}
+      <p class="dim">${model?.provider === 'claude-cli' ? 'Claude Code SDK: native tools, interactive questions and permissions, and native history on this host.' : model?.provider === 'codex-cli' ? 'Codex exec: native tools, transcript replay each turn. Native interactive approvals are not yet supported by this adapter; check its sandbox configuration before running host actions.' : 'API model: DO tools and transcript. Native Claude Code / Codex extensions are not available through this API adapter.'}</p>
+      <p class="dim">Turn steps: no DO cutoff. Output limit: ${esc(String(model?.maxTokens || (model?.provider === 'anthropic' ? '32,000 tokens per response' : 'provider default')))}.${model?.maxTurns ? ` Native turn limit configured: ${esc(String(model.maxTurns))}.` : ''}</p>
+    </details>
 
     <div class="actions"><button class="ghost" id="session-git">Git &amp; GitHub</button><button class="primary" id="s-close">done</button></div>`);
+  const replace = updated => { if (cur().session?.id === session.id) { cur().session = updated; if (state.tab === 'chat') state.session = updated; } };
   $('sheet').querySelectorAll('[data-tab-computer]').forEach(button => {
     button.onclick = async () => {
       button.disabled = true;
       try {
         const updated = await api(`/api/sessions/${session.id}/machine`, { method: 'POST', body: JSON.stringify({ ownerNode: button.dataset.tabComputer }) });
-        cur().session = updated;
-        state.session = updated;
+        replace(updated);
         await openSession(updated.id);
         await sessionSettingsSheet();
       } catch (e) { showBanner(e.message); button.disabled = false; }
     };
   });
-  if ($('s-choose-model')) $('s-choose-model').onclick = () => sessionSourceSheet(session);
+  $('s-choose-model').onclick = () => modelWizard(sessionModelTarget(session, sessionSettingsSheet));
   $('session-git').onclick = gitSheet;
   $('s-close').onclick = closeSheet;
-  if ($('s-effort-refresh')) $('s-effort-refresh').onclick = () => sessionSourceSheet(session, state.models[session.model].provider);
-  if ($('s-effort-save')) $('s-effort-save').onclick = async () => {
+  if ($('s-permission')) $('s-permission').onchange = async () => {
     try {
-      const updated = await api(`/api/sessions/${session.id}`, {method:'PATCH', body:JSON.stringify({effort:$('s-effort').value, ...($('s-permission') ? {claudePermission:$('s-permission').value} : {})})});
-      if (cur().session?.id === session.id) { cur().session = updated; state.session = updated; }
-      window.harnessTrace?.('visible', {screen:'session-settings', outcome:'effort-saved'});
-      paintHeader();
-      showBanner('Effort saved for subsequent turns.');
-    } catch (e) { showBanner(e.message); }
+      replace(await api(`/api/sessions/${session.id}`, {method:'PATCH', body:JSON.stringify({claudePermission:$('s-permission').value})}));
+      window.harnessTrace?.('visible', {screen:'session-settings', outcome:'permission-saved'});
+      showBanner(`Claude access: ${accessTitle($('s-permission').value)} from the next turn.`);
+    } catch (e) { showBanner(e.message, true); sessionSettingsSheet(); }
   };
-  if ($('s-rename')) {
-    const rename = async () => {
-      const name = $('s-name').value.trim();
-      if (!name || name === session.name) return;
-      const updated = await api(`/api/sessions/${session.id}`, {
-        method: 'PATCH', body: JSON.stringify({ name }),
-      });
-      const t = cur();
-      t.session = updated;
-      if (state.tab === 'chat') state.session = updated;
-      paintHeader();
-      await refreshState();          // the ☰ list shows the old name otherwise
-      showBanner(`renamed to "${name}"`);
-    };
-    $('s-rename').onclick = rename;
-    // Enter should work too; a phone keyboard offers "done", not a button.
-    $('s-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); rename(); } });
-  }
-  if ($('s-readable-save')) {
-    $('s-readable-save').onclick = async () => {
-      const dirs = $('s-readable').value.split('\n').map((x) => x.trim()).filter(Boolean);
-      const updated = await api(`/api/sessions/${session.id}`, {
-        method: 'PATCH', body: JSON.stringify({ readableDirs: dirs }),
-      });
-      const t = cur();
-      t.session = updated;
-      if (state.tab === 'chat') state.session = updated;
-      showBanner(dirs.length ? `${dirs.length} folder(s) readable` : 'no extra folders');
-      sessionSettingsSheet();
-    };
-  }
+  const rename = async () => {
+    const name = $('s-name').value.trim();
+    if (!name || name === session.name) return;
+    replace(await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ name }) }));
+    paintHeader();
+    await refreshState();          // the ☰ list shows the old name otherwise
+    showBanner(`renamed to "${name}"`);
+  };
+  $('s-rename').onclick = rename;
+  // Enter should work too; a phone keyboard offers "done", not a button.
+  $('s-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); rename(); } });
+  $('s-readable-save').onclick = async () => {
+    const dirs = $('s-readable').value.split('\n').map((x) => x.trim()).filter(Boolean);
+    replace(await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ readableDirs: dirs }) }));
+    showBanner(dirs.length ? `${dirs.length} folder(s) readable` : 'no extra folders');
+    sessionSettingsSheet();
+  };
   $('sheet').querySelectorAll('[data-band]').forEach((el) => {
     el.onclick = async () => {
-      const t = cur();
       try {
-        const updated = await api(`/api/sessions/${t.session.id}`, {
-          method: 'PATCH', body: JSON.stringify({ allowLongContext: el.dataset.band === 'on' }),
-        });
-        t.session = updated;
-        if (state.tab === 'chat') state.session = updated;
+        replace(await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ allowLongContext: el.dataset.band === 'on' }) }));
         sessionSettingsSheet();
       } catch (e) { showBanner(`couldn't change that: ${e.message}`, true); }
     };
   });
   $('sheet').querySelectorAll('[data-mode]').forEach((el) => {
     el.onclick = async () => {
-      const t = cur();
-      const want = el.dataset.mode;
       // Always send it — never trust local state to decide "already there", or a
       // stale copy could block the very switch the user is trying to make.
-      // A silently-failed PATCH used to leave the toggle looking stuck — the
-      // reported "switched to chat and couldn't switch back". Show what happened.
       el.textContent = '…';
       try {
-        const updated = await api(`/api/sessions/${t.session.id}`, {
-          method: 'PATCH', body: JSON.stringify({ mode: want }),
-        });
-        t.session = updated;
-        if (state.tab === 'chat') state.session = updated;
+        replace(await api(`/api/sessions/${session.id}`, { method: 'PATCH', body: JSON.stringify({ mode: el.dataset.mode }) }));
         paintHeader();
         sessionSettingsSheet();
       } catch (e) {
@@ -1973,19 +2110,11 @@ async function sessionSettingsSheet() {
       }
     };
   });
-  $('sheet').querySelectorAll('[data-switch]').forEach((el) => {
-    el.onclick = async () => {
-      await setSessionModel(el.dataset.switch);
-      sessionSettingsSheet();   // redraw so "in use" moves to the model just chosen
-    };
-  });
-  if ($('s-browse')) {
-    $('s-browse').onclick = () => browseSheet($('s-dir').value, async (chosen) => {
-      await setProjectDir(chosen);
-      sessionSettingsSheet();
-    }, sessionSettingsSheet);
-    $('s-dir-save').onclick = () => setProjectDir($('s-dir').value.trim()).then(sessionSettingsSheet);
-  }
+  $('s-browse').onclick = () => browseSheet($('s-dir').value, async (chosen) => {
+    await setProjectDir(chosen);
+    sessionSettingsSheet();
+  }, sessionSettingsSheet);
+  $('s-dir-save').onclick = () => setProjectDir($('s-dir').value.trim()).then(sessionSettingsSheet);
 }
 
 /**
@@ -2188,6 +2317,7 @@ async function modelsSheet() {
     openSheet(`<h2>AI sources</h2>
       <label>Computer</label><select id="sources-host">${machines.hosts.filter(h => h.member).map(h => `<option value="${sourceAttr(h.id)}" ${h.id === sourceHost ? 'selected' : ''}>${esc(h.name)}</option>`).join('')}</select>
       <p class="dim"><b>${esc(catalog.machine.name)}</b> — sources configured on this computer only. New computers start empty. Connect a source, discover its models, then choose which to add.</p>
+      <div class="rowlinks"><button class="rowlink" id="source-default"><span>Default for new sessions</span><span class="dim">${esc(modelChoiceLabel(catalog.models[catalog.default], catalog.defaultEffort))} ›</span></button></div>
       <button class="rowlink" id="source-claude">${sourceLabel('claude-cli', 'Claude Code')} <span>›</span></button>
       <button class="rowlink" id="source-codex">${sourceLabel('codex-cli', 'Codex')} <span>›</span></button>
       <button class="rowlink" id="source-local">${Object.values(catalog.models).some(m => m.sourceKind === 'ollama') ? 'Manage' : 'Set up'} local models · Ollama <span>›</span></button>
@@ -2216,6 +2346,9 @@ async function modelsSheet() {
     $('sources-host').onchange = () => { sourceHost = $('sources-host').value; modelsSheet(); };
     $('sub-back').onclick = settingsSheet;
     $('sources-refresh').onclick = modelsSheet;
+    $('source-default').onclick = async () => {
+      try { await modelWizard(await defaultModelTarget(host, modelsSheet)); } catch (e) { showBanner(e.message, true); }
+    };
     $('source-claude').onclick = () => onboardSource('claude-cli');
     $('source-codex').onclick = () => onboardSource('codex-cli');
     $('source-local').onclick = () => onboardSource('ollama');
@@ -3706,9 +3839,25 @@ $('input').addEventListener('paste', (event) => {
   attachFiles(files);
 });
 
+$('model-gear').onclick = () => {
+  window.harnessTrace?.('action', { control: 'model-gear' });
+  if (state.session) modelWizard(sessionModelTarget(state.session));
+};
 $('send').onclick = () => send();
 $('queue').onclick = () => send(true);
 $('stop').onclick = () => api(`/api/sessions/${cur().session.id}/stop`, { method: 'POST' });
+$('pause').onclick = async () => {
+  window.harnessTrace?.('action', { control: 'pause' });
+  try { await api(`/api/sessions/${cur().session.id}/pause`, { method: 'POST' }); setPaused(true); }
+  catch (e) { showBanner(e.message, true); }
+};
+$('resume').onclick = async () => {
+  window.harnessTrace?.('action', { control: 'resume' });
+  $('resume').disabled = true;
+  try { await api(`/api/sessions/${cur().session.id}/resume`, { method: 'POST' }); setPaused(false); }
+  catch (e) { showBanner(e.message, true); }
+  finally { $('resume').disabled = false; }
+};
 
 $('sheet-back').onclick = (e) => {
   if (e.target.id !== 'sheet-back') return;

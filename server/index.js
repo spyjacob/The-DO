@@ -153,7 +153,11 @@ async function collectUsage({ force = false } = {}) {
   return added;
 }
 
+const CLAUDE_PERMISSIONS = ['default','acceptEdits','auto','bypassPermissions','plan'];
 const messageQueue = createMessageQueue();
+// Paused sessions (in memory, like the queue): id -> whether a running turn was interrupted.
+const paused = new Map();
+const RESUME_TEXT = 'Resume: the previous turn was paused before it finished. Check what was already done, then continue from there without repeating completed steps.';
 const messageAdmissions = new Map();
 const interactionChains = new Map();
 const interactions = new Map(); // Live provider requests; never inferred from assistant prose.
@@ -501,6 +505,7 @@ async function sourceAction(body) {
     if ([...live.values()].some(s => s.model === args.alias)) throw new Error('Wait for sessions using this source to finish.');
     return aiSources.remove(args.alias);
   }
+  if (action === 'default') return aiSources.setDefault(args);
   if (action === 'helper-setting') return aiSources.delegateSetting(args.alias, args.enabled);
   if (action === 'local') return aiSources.localAction(args.operation, args.model);
   if (action === 'helper') return aiSources.helper(args);
@@ -513,7 +518,7 @@ async function requireConnection() {
   if (!network.connected) throw new Error(network.error);
 }
 
-async function scheduleTurn(id, body, queueNext = false) {
+async function scheduleTurn(id, body, queueNext = false, { front = false } = {}) {
   usageHistory?.record('turn.requested', { correlationId: body.traceId });
   const queued = messageQueue.busy(id);
   body.pendingId = crypto.randomUUID();
@@ -530,7 +535,7 @@ async function scheduleTurn(id, body, queueNext = false) {
       refuse(e);
       broadcast(id, { kind: 'error', error: e.message });
     }
-  }, { queue: queueNext, onError: refuse, body });
+  }, { queue: queueNext, front, onError: refuse, body });
   if (queued) broadcast(id, { kind: 'pending', pending: messageQueue.pending(id) });
   if (queued) { started.catch(() => {}); return true; }
   await started;
@@ -1323,6 +1328,7 @@ const server = http.createServer(async (req, res) => {
           const session = store.newSession({
             name: 'Tab 1', model: cfg.default, projectDir: app.dir, appId: app.id,
           });
+          if (cfg.defaultEffort) session.effort = cfg.defaultEffort;
           await store.save(session);
           return json(res, 200, { ...app, sessionId: session.id });
         }
@@ -1954,13 +1960,16 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const error = assignmentError(session, ownerNode, hosts);
         if (error) return json(res, 409, { error });
         const inventory = ownerNode === cluster.self.id ? await modelInventory(await loadConfig(USER_DATA)) : await cluster.hostModels(ownerNode);
-        if (!inventory.models[session.model]?.available) session.model = inventory.default;
+        const fallback = !inventory.models[session.model]?.available;
+        if (fallback) session.model = inventory.default;
         if (!session.model) return json(res, 400, { error: 'No available models on this computer.' });
         // Assignment shares the same serialized commit path as worker writes.
         const assign = latest => {
           const changed = assignmentError(latest, ownerNode, hosts);
           if (changed) throw new Error(changed);
           latest.model = session.model;
+          // The old effort belonged to the old model; the new default brings its own.
+          if (fallback) { if (inventory.defaultEffort) latest.effort = inventory.defaultEffort; else delete latest.effort; }
           latest.ownerNode = ownerNode;
           latest.executionEpoch = (latest.executionEpoch || 0) + 1;
           return latest;
@@ -1975,7 +1984,10 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         return json(res, 200, await modelInventory(cfg));
       }
       if (req.method === 'POST' && !id) {
-        const { name, model, projectDir: askedDir, system, mode, appId, ownerNode: requestedOwner } = await readBody(req);
+        const { name, model, effort, claudePermission, projectDir: askedDir, system, mode, appId, ownerNode: requestedOwner } = await readBody(req);
+        if (claudePermission !== undefined && !CLAUDE_PERMISSIONS.includes(claudePermission)) return json(res, 400, { error: 'Invalid Claude permission mode.' });
+        if (effort !== undefined && (typeof effort !== 'string' || (effort !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(effort))))
+          return json(res, 400, { error: 'Invalid effort level.' });
         let ownerNode = cluster.self.id;
         // An app owns its directory; a session attached to one works there
         // rather than carrying a directory of its own.
@@ -2001,7 +2013,15 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const inventory = ownerNode === cluster.self.id ? await modelInventory(await loadConfig(USER_DATA)) : await cluster.hostModels(ownerNode);
         const selectedModel = inventory.models[model]?.available ? model : inventory.default;
         if (!selectedModel) return json(res, 400, { error: 'No available models on this computer.' });
+        // An explicit effort applies only to the model it was chosen for; otherwise
+        // the computer's default model brings its default effort.
+        const sessionEffort = selectedModel === model && effort !== undefined ? effort
+          : selectedModel === inventory.default ? inventory.defaultEffort || '' : '';
+        try { validateEffort(inventory.models[selectedModel], sessionEffort); }
+        catch (error) { return json(res, 400, { error: error.message }); }
         const session = store.newSession({ name, model: selectedModel, projectDir, system, mode, appId: appId ?? null });
+        if (sessionEffort) session.effort = sessionEffort;
+        if (claudePermission && inventory.models[selectedModel]?.provider === 'claude-cli') session.claudePermission = claudePermission;
         session.ownerNode = ownerNode;
         if (editsHarness) session.editsHarness = true;
         await store.save(session);
@@ -2018,7 +2038,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         // Rooted at home means every project on the machine is in scope, which
         // is never what was wanted and is worth surfacing rather than inferring.
         session.projectDirIsHome = path.resolve(session.projectDir) === path.resolve(os.homedir());
-        return json(res, 200, { ...session, busy:messageQueue.busy(id) || running.has(id) });
+        return json(res, 200, { ...session, busy:messageQueue.busy(id) || running.has(id), paused:paused.has(id) });
       }
       if (req.method === 'DELETE' && id && !verb) {
         if (running.has(id)) return json(res, 409, { error: 'Stop the turn and wait for it to finish before deleting this session.' });
@@ -2034,7 +2054,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const patch = await readBody(req);
         if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return json(res,400,{error:'Session settings must be an object.'});
         if (running.has(id)) return json(res, 409, { error: 'Wait for the current turn and integration to finish before editing this session.' });
-        if (patch.claudePermission !== undefined && !['default','acceptEdits','plan','bypassPermissions'].includes(patch.claudePermission))
+        if (patch.claudePermission !== undefined && !CLAUDE_PERMISSIONS.includes(patch.claudePermission))
           return json(res, 400, {error:'Invalid Claude permission mode.'});
         if (patch.effort !== undefined && (typeof patch.effort !== 'string' || (patch.effort !== '' && !/^[a-z][a-z0-9_-]{0,31}$/.test(patch.effort))))
           return json(res, 400, { error: 'Invalid effort level.' });
@@ -2139,12 +2159,16 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
           const answer = await readBody(req, 65536);
           if (!pending || pending.request.id !== answer.id) return json(res, 409, {error:'This request has already been answered or stopped.'});
           if (typeof answer.allow !== 'boolean') return json(res, 400, {error:'Choose approve or decline.'});
+          if (answer.scope !== undefined && (!['once','always','all'].includes(answer.scope) || pending.request.kind !== 'permission'
+              || (answer.scope === 'always' && !pending.request.always?.length)))
+            return json(res, 400, {error:'That approval option is not available for this request.'});
           if (answer.allow && pending.request.kind === 'question') {
             const questions = pending.request.input.questions || [];
             if (!answer.answers || questions.some(q => typeof answer.answers[q.question] !== 'string' || !answer.answers[q.question].trim()))
               return json(res, 400, {error:'Answer each question before continuing.'});
           }
-          pending.finish({allow:answer.allow, answers:answer.answers});
+          pending.finish({allow:answer.allow, answers:answer.answers, scope:answer.scope || 'once'});
+          usageHistory?.record('interaction.answered', {correlationId:requestId, outcome:answer.allow ? answer.scope || 'once' : 'declined'});
           return json(res, 200, {ok:true});
         }
       }
@@ -2163,8 +2187,37 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
           return json(res, 200, {pending:messageQueue.pending(id)});
         }
       }
+      // Pause: stop the turn now but keep queued messages; Resume continues the work.
+      if (req.method === 'POST' && id && verb === 'pause') {
+        const turn = running.get(id);
+        if (!turn && !messageQueue.pending(id).length) return json(res, 409, { error: 'Nothing is running to pause.' });
+        paused.set(id, { interrupted: Boolean(turn) || Boolean(paused.get(id)?.interrupted), at: Date.now() });
+        messageQueue.hold(id);
+        turn?.controller.abort();
+        broadcast(id, { kind: 'paused', paused: true });
+        usageHistory?.record('turn.paused', { correlationId: requestId, outcome: turn ? 'interrupted' : 'queue-held', count: messageQueue.pending(id).length });
+        return json(res, 200, { ok: true, paused: true });
+      }
+      if (req.method === 'POST' && id && verb === 'resume') {
+        const held = paused.get(id);
+        if (!held) return json(res, 409, { error: 'This session is not paused.' });
+        paused.delete(id);
+        broadcast(id, { kind: 'paused', paused: false });
+        try {
+          // The interrupted work goes first, then anything that was queued.
+          if (held.interrupted) await scheduleTurn(id, { text: RESUME_TEXT, traceId: requestId }, true, { front: true });
+        } catch (e) {
+          paused.set(id, held);
+          broadcast(id, { kind: 'paused', paused: true });
+          return json(res, 409, { error: e.message });
+        } finally { if (!paused.has(id)) messageQueue.release(id); }
+        usageHistory?.record('turn.resumed', { correlationId: requestId, outcome: held.interrupted ? 'continued' : 'queue-released', durationMs: Date.now() - held.at });
+        return json(res, 200, { ok: true, pending: messageQueue.pending(id) });
+      }
       if (req.method === 'POST' && id && verb === 'stop') {
+        if (paused.delete(id)) broadcast(id, { kind: 'paused', paused: false });
         messageQueue.cancel(id);
+        messageQueue.release(id);
         broadcast(id, {kind:"pending", pending:null});
         running.get(id)?.controller.abort();
         return json(res, 200, { ok: true });
@@ -2181,7 +2234,7 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
         const live = running.get(id);
         res.write(`retry: 2000\n\ndata: ${JSON.stringify({
           kind: 'hello', pending: messageQueue.pending(id), interaction: interactions.get(id)?.request || null,
-          running: Boolean(live),
+          running: Boolean(live), paused: paused.has(id),
           startedAt: live?.startedAt ?? null,
           last: live?.last ?? null,
         })}\n\n`);
@@ -2239,7 +2292,10 @@ Preserve both branches' intended behavior. Merge and commit the resolution on th
               if (existing.events.some(e => e.clientMessageId === body.clientMessageId)
                 || messageQueue.pending(id).some(e => e.clientMessageId === body.clientMessageId)) return {duplicate:true};
             }
-            const queued = await scheduleTurn(id, { ...body, traceId: requestId }, verb === 'queue');
+            // Sending while paused resumes with this message instead of an automatic continue.
+            const wasPaused = paused.delete(id);
+            if (wasPaused) { broadcast(id, { kind: 'paused', paused: false }); messageQueue.release(id); }
+            const queued = await scheduleTurn(id, { ...body, traceId: requestId }, verb === 'queue' || wasPaused);
             return {queued};
           };
           const operation = admit();

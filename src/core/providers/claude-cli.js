@@ -9,6 +9,15 @@ import path from 'node:path';
 
 import { renderForPrompt } from '../transcript.js';
 
+/** Short, display-only description of one Claude permission suggestion. */
+function permissionSummary(update = {}) {
+  const clip = text => String(text).slice(0, 160);
+  if (['addRules','replaceRules'].includes(update.type)) return (update.rules || []).map(r => clip(r.ruleContent ? `${r.toolName}(${r.ruleContent})` : r.toolName));
+  if (update.type === 'addDirectories') return (update.directories || []).map(d => clip('access ' + d));
+  if (update.type === 'setMode') return [clip('switch to ' + update.mode)];
+  return [];
+}
+
 export const kind = 'claude-cli';
 
 export function makeClient(spec) {
@@ -195,14 +204,23 @@ ${needsExcerpt ? prompt.slice(-32000) : prompt}`;
       systemPrompt: {type:'preset', preset:'claude_code', append:(system || '') + (historyDir ? '\nThe temporary DO history file named in the prompt belongs to this conversation and may be read for context. Native permission checks still apply.' : '')},
       settingSources: ['user', 'project', 'local'],
       permissionMode: spec.permissionMode || 'default',
-      allowDangerouslySkipPermissions: spec.permissionMode === 'bypassPermissions',
+      // Lets "allow everything" in a prompt raise this session's mode; it does not activate bypass by itself.
+      allowDangerouslySkipPermissions: spec.permissionMode === 'bypassPermissions' || Boolean(requestInteraction),
       ...(!useTools ? {tools:[]} : {}),
       stderr: text => { stderr = (stderr + text).slice(-4000); },
       canUseTool: async (tool, input, options) => {
         if (!requestInteraction) return {behavior:'deny', message:'This invocation has no interactive approval surface.'};
-        const answer = await requestInteraction({tool, input, kind:tool === 'AskUserQuestion' ? 'question' : 'permission'}, options.signal);
+        const question = tool === 'AskUserQuestion';
+        // Claude's own "don't ask again" rules, shown so the user knows what Always allow covers.
+        const always = question ? [] : (options.suggestions || []).flatMap(permissionSummary).slice(0, 6);
+        const answer = await requestInteraction({tool, input, kind:question ? 'question' : 'permission', ...(always.length ? {always} : {})}, options.signal);
         if (!answer.allow) return {behavior:'deny', message:answer.message || 'User declined this request.'};
-        return {behavior:'allow', updatedInput: tool === 'AskUserQuestion' ? {...input, answers:answer.answers} : input};
+        if (question) return {behavior:'allow', updatedInput:{...input, answers:answer.answers}};
+        if (answer.scope === 'all') {
+          reply.permissionMode = 'bypassPermissions';
+          return {behavior:'allow', updatedInput:input, updatedPermissions:[{type:'setMode', mode:'bypassPermissions', destination:'session'}]};
+        }
+        return {behavior:'allow', updatedInput:input, ...(answer.scope === 'always' && options.suggestions?.length ? {updatedPermissions:options.suggestions} : {})};
       },
     }});
     for await (const message of stream) {
@@ -225,7 +243,7 @@ ${needsExcerpt ? prompt.slice(-32000) : prompt}`;
       : `claude exited ${code}${stderr.trim() ? `: ${stderr.trim().slice(0, 400)}` : ''}`;
   }
   if (reply.error && /oauth|authentication|authenticate|not logged in|token.*expired/i.test(reply.error)) {
-    reply.error = 'Claude Code login needs attention on this session’s computer. Open session settings → Source → model → Claude Code for sign-in instructions, then retry your message.';
+    reply.error = 'Claude Code login needs attention on this session’s computer. Tap ⚙ beside the model in the header → Claude for sign-in instructions, then retry your message.';
   }
   return reply;
 }

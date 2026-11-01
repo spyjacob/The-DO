@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import spawn from 'cross-spawn';
 import { updateConfig, loadConfig } from './config.js';
 import { codexModels, claudeModels, sourceEnv } from './source-discovery.js';
+import { validateEffort } from './model-effort.js';
 
 const OLLAMA = 'http://127.0.0.1:11434';
 const kinds = ['claude-cli', 'codex-cli', 'ollama'];
@@ -64,7 +65,7 @@ export function createAISources(dir, { request = fetch, discoverClaude = claudeM
             if (runtime?.unavailable) return 'runtime unavailable';
             return runtime?.models?.some(r => r.name === m.model || r.model === m.model) ? 'loaded' : 'not loaded';
           })() } : {}) }])),
-        default: cfg.default, error: cfg.error, jobs: [...jobs.values()] };
+        default: cfg.default, defaultEffort: cfg.defaultEffort, error: cfg.error, jobs: [...jobs.values()] };
     },
     async discover(kind) {
       if (!kinds.includes(kind)) throw new Error('Choose Claude Code, Codex, or Ollama.');
@@ -119,11 +120,23 @@ export function createAISources(dir, { request = fetch, discoverClaude = claudeM
         return { aliases };
       });
     },
+    // The model and effort new sessions on this computer start with.
+    async setDefault({ alias, effort = '' }) {
+      if (typeof effort !== 'string' || (effort && !/^[a-z][a-z0-9_-]{0,31}$/.test(effort))) throw new Error('Invalid effort level.');
+      return mutate(raw => {
+        const spec = raw.models?.[alias];
+        if (!spec) throw new Error('Unknown source.');
+        validateEffort(spec, effort);
+        raw.default = alias;
+        if (effort) raw.defaultEffort = effort; else delete raw.defaultEffort;
+        return { default: alias, defaultEffort: effort || null };
+      });
+    },
     async remove(alias) {
       return mutate(raw => {
         if (!raw.models?.[alias]) throw new Error('Unknown source.');
         delete raw.models[alias];
-        if (raw.default === alias) raw.default = Object.keys(raw.models)[0] || null;
+        if (raw.default === alias) { raw.default = Object.keys(raw.models)[0] || null; delete raw.defaultEffort; }
         return { ok: true };
       });
     },

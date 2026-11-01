@@ -325,3 +325,77 @@ pass-through and resume. Live account inference was not exercised.
 Desktop menus use a centered 720px dialog and content-sized action buttons;
 phones retain bottom sheets. Source model choices form two columns on desktop
 and one on phones. Browser checks cover 390px and 1280px layouts and login errors.
+
+## Header model gear: provider → model → effort
+
+A ⚙ beside the model line in the header (and the Edit session row) opens a
+three-step picker: Claude / OpenAI / Local, then that group's models on the
+session's computer, then effort when the model reports supported levels. Nothing
+is saved until the final choice, which sends one PATCH `{model, effort}`; ✕ at any
+step leaves the session unchanged. Back reuses the already-loaded catalog. Groups
+are derived from provider: claude-cli/anthropic → Claude; codex-cli/openai/
+openai-responses → OpenAI; Ollama or a loopback baseUrl → Local. Local discovery
+only registers models not already saved, because re-adding resets a model's
+helper permission. Models without effort levels skip the effort step and reset to
+the default (a saved override is kept only for the unchanged model with unknown
+levels). A refused switch (e.g. turn running) keeps the picker open with the error.
+
+Traces: `visible` screen `model-wizard` with outcome provider/model/effort/models/
+empty/error/applied/apply-error and the provider group; `action` controls
+`model-gear` and `model-wizard-close` (with the step it was closed on). Covered by
+`scripts/hardening-browser-check.mjs` at 390px and 1280px, including cancel,
+back, no-effort, refused-switch and expired-login paths.
+
+### One flow everywhere; default model; simpler Session sheet
+
+`modelWizard(target)` now takes a target `{host, alias, current, effort, purpose,
+exit, live?, save(alias, effort, model)}`. Targets: `sessionModelTarget` (header
+gear, Session sheet), New session (writes the draft and returns to the form), and
+`defaultModelTarget` (Settings → Default model, and AI sources → Default for new
+sessions on the selected computer). The default is per computer: source action
+`default {alias, effort}` validates effort against that model and stores
+`default`/`defaultEffort` in that computer's models.json (removing the default
+model clears its effort). New sessions take an explicit `effort` when given for
+the chosen model, otherwise the default model's `defaultEffort`; new project tabs
+and a move that falls back to the default model do the same.
+
+Mode stays per session (agent/chat), shown right under the model row. It is only
+model-dependent for local models without tool support: picking one sets chat and
+disables agent; switching from one to a tool model restores agent. The Session
+sheet is now name, computer (move to another enabled online computer when allowed),
+model row → wizard, mode, Claude permissions (saved on change), context band, and
+a collapsed "Folders and details". The old effort dropdown and its save/refresh
+buttons are gone; the wizard covers both.
+
+Not built: copying a tab that already has a Git worktree to another computer.
+The server refuses that move (tab branches are not migrated between hosts), and
+the sheet says so. Traces add `action` control `default-model`.
+
+### Header label, Claude access, pause
+
+Header: `Claude|OpenAI|Local · Subscription|API · model · effort` (access omitted for
+Local/unknown providers; effort only when set, with "(unsupported)" if the model's
+known levels exclude it).
+
+Claude access: modes default / acceptEdits / auto / bypassPermissions / plan
+(`auto` = Claude Code's classifier mode; needs a plan that supports it — not
+verified live here). Chosen in Session → Claude access, or as a fourth wizard step
+("Access") for Claude Code models in the session and New session flows (not for
+the Settings default). Permission prompts now offer allow once / always allow /
+allow everything / decline. Always allow returns the SDK's own `suggestions` as
+`updatedPermissions` (usually a rule in the project's .claude/settings.local.json,
+exactly as Claude Code's "don't ask again"); the prompt shows the rule text.
+Allow everything returns `setMode bypassPermissions` for the running query and
+persists `session.claudePermission` for later turns. Because of that,
+`allowDangerouslySkipPermissions` is passed whenever an interactive surface exists;
+it permits, but does not activate, bypass. Trace: server `interaction.answered`
+(outcome once/always/all/declined).
+
+Pause (`POST /api/sessions/:id/pause|resume`, owner-routed like other session
+verbs): pause aborts the running turn now and holds queued messages (queue
+`hold/release`); resume first runs a visible "Resume: …" continuation if a turn
+was interrupted, then the held queue. Sending while paused clears the pause and
+runs that message (after any held ones) instead of the automatic continuation.
+Stop clears pause and the queue. Pause state lives in memory like the queue, so a
+server restart drops it. Traces: `turn.paused`, `turn.resumed`; client controls
+`pause`/`resume`, screen `paused`.

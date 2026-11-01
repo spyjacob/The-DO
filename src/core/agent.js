@@ -328,6 +328,11 @@ async function runTurnInner({
     }
 
     await stepSaves;
+    // "Allow everything" chosen in a prompt keeps applying to later turns of this session.
+    if (reply.permissionMode && reply.permissionMode !== session.claudePermission) {
+      session.claudePermission = reply.permissionMode;
+      await save(session);
+    }
     if (nativeId && !reply.error) {
       session.nativeClaude = {id:nativeId, cwd, host:session.ownerNode, model:session.model, context, history:fingerprint(session.events)};
       await save(session);

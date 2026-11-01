@@ -19,7 +19,7 @@
       <button id="menu" class="tap" aria-label="Apps">☰</button>
       <div id="title">
         <div id="title-name">Distributed Orchestrator</div>
-        <div id="title-sub">pick a session</div>
+        <div id="title-model"><span id="title-sub">pick a session</span><button id="model-gear" class="tap" aria-label="Change model" title="Change provider, model or effort" hidden>⚙</button></div>
         <div id="header-revision"><!-- serving-revision --></div>
       </div>
       <button id="usage" class="tap" aria-label="Usage">📊</button>
@@ -35,6 +35,12 @@
       <span class="pulse"></span>
       <span id="working-label">working</span>
       <span id="working-time" class="mono"></span>
+    </div>
+
+    <div id="paused" role="status" hidden>
+      <span>Paused</span>
+      <span id="paused-detail">Resume continues the work; queued messages wait.</span>
+      <button id="resume" class="primary">resume</button>
     </div>
 
     <main id="transcript">
@@ -59,6 +65,7 @@
       <button id="dictate" class="ghost attach-btn" aria-label="Record voice message" title="Dictate a message">🎙</button>
       <button id="send" class="primary">send</button>
       <button id="queue" class="primary" hidden title="Run this message after the current turn; Stop cancels it">queue</button>
+      <button id="pause" class="ghost attach-btn" hidden title="Pause now, keep queued messages, resume later">pause</button>
       <button id="stop" class="danger" hidden>stop</button>
     </footer>
 
